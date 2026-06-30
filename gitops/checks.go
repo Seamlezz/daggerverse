@@ -13,9 +13,9 @@ var checkScriptFS embed.FS
 
 func (m *Gitops) checkRunner() checks.Runner {
 	config := checks.Config{
-		Clusters:          m.Clusters,
-		KubeVersion:       m.KubeVersion,
-		KubeconformSkips:  m.KubeconformSkips,
+		Clusters:           m.Clusters,
+		KubeVersion:        m.KubeVersion,
+		KubeconformSkips:   m.KubeconformSkips,
 		KubeconformIgnores: m.KubeconformIgnores,
 	}
 	return checks.NewRunner(dag.Container, checkScriptFS, "scripts/check", checks.DefaultToolVersions(), config)
@@ -40,7 +40,7 @@ func (m *Gitops) CheckKubeconform(
 	// +ignore=["target", ".git", "docs"]
 	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckKubeconform(ctx, source, m.googleCredentials)
+	return m.checkRunner().CheckKubeconform(ctx, source, m.GoogleCredentials)
 }
 
 // CheckFluxIntegrity validates Flux Kustomization paths and dependsOn references.
@@ -62,7 +62,7 @@ func (m *Gitops) CheckSopsDecrypt(
 	// +ignore=["target", ".git", "docs"]
 	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckSopsDecrypt(ctx, source, m.googleCredentials)
+	return m.checkRunner().CheckSopsDecrypt(ctx, source, m.GoogleCredentials)
 }
 
 // CheckTerraform validates and format-checks Terraform environments.
@@ -95,5 +95,5 @@ func (m *Gitops) CheckHelmReleases(
 	// +ignore=["target", ".git", "docs"]
 	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckHelmReleases(ctx, source, m.googleCredentials)
+	return m.checkRunner().CheckHelmReleases(ctx, source, m.GoogleCredentials)
 }

@@ -46,13 +46,16 @@ type Gitops struct {
 	// KubeconformIgnores are filename patterns to ignore during kubeconform validation.
 	KubeconformIgnores []string
 
-	// --- Services and secrets (set via constructor, defaults from .env) ---
-
-	githubToken       *dagger.Secret
-	googleCredentials *dagger.Secret
-	k8sService        *dagger.Service
-	gitService        *dagger.Service
-	kubeconfig        *dagger.Secret
+	// +private
+	GithubToken *dagger.Secret
+	// +private
+	GoogleCredentials *dagger.Secret
+	// +private
+	K8sService *dagger.Service
+	// +private
+	GitService *dagger.Service
+	// +private
+	Kubeconfig *dagger.Secret
 }
 
 // New creates a GitOps workflow module configured for a specific repository.
@@ -130,22 +133,22 @@ func New(
 	kubeconfig *dagger.Secret,
 ) *Gitops {
 	return &Gitops{
-		BootstrapPath:     bootstrapPath,
-		GitRepoName:       gitRepoName,
-		GitBranch:         gitBranch,
-		FluxNamespace:     fluxNamespace,
-		FluxSourceName:    fluxSourceName,
-		GitUserName:       gitUserName,
-		GitUserEmail:      gitUserEmail,
-		Clusters:          clusters,
-		KubeVersion:       kubeVersion,
-		KubeconformSkips:  kubeconformSkips,
+		BootstrapPath:      bootstrapPath,
+		GitRepoName:        gitRepoName,
+		GitBranch:          gitBranch,
+		FluxNamespace:      fluxNamespace,
+		FluxSourceName:     fluxSourceName,
+		GitUserName:        gitUserName,
+		GitUserEmail:       gitUserEmail,
+		Clusters:           clusters,
+		KubeVersion:        kubeVersion,
+		KubeconformSkips:   kubeconformSkips,
 		KubeconformIgnores: kubeconformIgnores,
-		githubToken:       githubToken,
-		googleCredentials: googleCredentials,
-		k8sService:        k8sService,
-		gitService:        gitService,
-		kubeconfig:        kubeconfig,
+		GithubToken:        githubToken,
+		GoogleCredentials:  googleCredentials,
+		K8sService:         k8sService,
+		GitService:         gitService,
+		Kubeconfig:         kubeconfig,
 	}
 }
 
@@ -161,8 +164,8 @@ func (m *Gitops) kubeClient() *dagger.Container {
 		From("fluxcd/flux-cli:v2.8.6").
 		WithUser("root").
 		WithExec([]string{"apk", "add", "--no-cache", "git", "rsync"}).
-		WithServiceBinding("kubernetes", m.k8sService).
-		WithMountedSecret("/tmp/kubeconfig", m.kubeconfig, dagger.ContainerWithMountedSecretOpts{Mode: 0444}).
+		WithServiceBinding("kubernetes", m.K8sService).
+		WithMountedSecret("/tmp/kubeconfig", m.Kubeconfig, dagger.ContainerWithMountedSecretOpts{Mode: 0444}).
 		WithExec([]string{"sh", "-c", "sed 's#https://127\\.0\\.0\\.1:6550#https://kubernetes:6550#g' /tmp/kubeconfig > /tmp/kubeconfig.docker"}).
 		WithEnvVariable("KUBECONFIG", "/tmp/kubeconfig.docker")
 }
@@ -177,7 +180,7 @@ func (m *Gitops) pushLocalGit(ctx context.Context, source *dagger.Directory) (st
 			Exclude:   []string{".git"},
 			Gitignore: true,
 		}).
-		WithServiceBinding("gitServer", m.gitService)
+		WithServiceBinding("gitServer", m.GitService)
 
 	return c.
 		WithExec([]string{"git", "clone", "-b", m.GitBranch, gitURL, repoDir}).
