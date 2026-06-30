@@ -1,0 +1,7 @@
+{
+  "name": "gitops",
+  "engineVersion": "v0.21.7",
+  "sdk": {
+    "source": "go"
+  }
+}
