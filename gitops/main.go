@@ -11,6 +11,9 @@ import (
 // Gitops is a reusable Dagger module for GitOps workflows.
 // It provides local Git mirror push/reload, Flux bootstrap, and static validation checks.
 type Gitops struct {
+	// Source is the working tree directory.
+	Source *dagger.Directory
+
 	// GitRepoName is the bare repo name in the in-cluster Git mirror.
 	// Example: "infra.git"
 	GitRepoName string
@@ -56,6 +59,13 @@ type Gitops struct {
 
 // New creates a GitOps workflow module configured for a specific repository.
 func New(
+	// Source is the working tree directory.
+	source *dagger.Workspace,
+
+	// +optional
+	// +default="/"
+	rootDir string,
+
 	// GitRepoName is the bare repo name in the in-cluster Git mirror.
 	// Example: "infra.git"
 	gitRepoName string,
@@ -125,6 +135,10 @@ func New(
 	kubeconfig *dagger.Secret,
 ) *Gitops {
 	return &Gitops{
+		Source: source.Directory(rootDir, dagger.WorkspaceDirectoryOpts{
+			Exclude:   []string{"target", ".git", "docs", "node_modules", ".dart_tool", "build", "dist", "assets"},
+			Gitignore: true,
+		}),
 		GitRepoName:        gitRepoName,
 		GitBranch:          gitBranch,
 		FluxNamespace:      fluxNamespace,
@@ -163,11 +177,11 @@ func (m *Gitops) kubeClient() *dagger.Container {
 
 // pushLocalGit clones the in-cluster Git mirror, rsyncs the working tree,
 // commits, and pushes.
-func (m *Gitops) pushLocalGit(ctx context.Context, source *dagger.Directory) (string, error) {
+func (m *Gitops) pushLocalGit(ctx context.Context) (string, error) {
 	gitURL := fmt.Sprintf("http://gitServer:30080/git/%s", m.GitRepoName)
 
 	c := m.kubeClient().
-		WithDirectory(workspaceDir, source, dagger.ContainerWithDirectoryOpts{
+		WithDirectory(workspaceDir, m.Source, dagger.ContainerWithDirectoryOpts{
 			Exclude:   []string{".git"},
 			Gitignore: true,
 		}).
@@ -186,10 +200,10 @@ func (m *Gitops) pushLocalGit(ctx context.Context, source *dagger.Directory) (st
 }
 
 // fluxBootstrap installs Flux and applies the bootstrap kustomization.
-func (m *Gitops) fluxBootstrap(ctx context.Context, source *dagger.Directory, bootstrapPath string) (string, error) {
+func (m *Gitops) fluxBootstrap(ctx context.Context, bootstrapPath string) (string, error) {
 	return m.kubeClient().
 		WithExec([]string{"flux", "install"}).
-		WithDirectory(workspaceDir, source).
+		WithDirectory(workspaceDir, m.Source).
 		WithExec([]string{"kubectl", "apply", "-k", workspaceDir + "/" + bootstrapPath}).
 		Stdout(ctx)
 }
@@ -294,17 +308,14 @@ func (m *Gitops) fluxWait(ctx context.Context) (string, error) {
 // the in-cluster Git mirror. Runs: push → flux install → apply bootstrap → wait ready.
 func (m *Gitops) Initialize(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 	// BootstrapPath is the Flux bootstrap kustomization path within the repo.
 	// Example: "clusters/local/flux-system"
 	bootstrapPath string,
 ) error {
-	if _, err := m.pushLocalGit(ctx, source); err != nil {
+	if _, err := m.pushLocalGit(ctx); err != nil {
 		return err
 	}
-	if _, err := m.fluxBootstrap(ctx, source, bootstrapPath); err != nil {
+	if _, err := m.fluxBootstrap(ctx, bootstrapPath); err != nil {
 		return err
 	}
 	if _, err := m.fluxWait(ctx); err != nil {
@@ -317,13 +328,10 @@ func (m *Gitops) Initialize(
 // and reconciles Flux. Runs: push → reconcile → wait ready.
 func (m *Gitops) Reload(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) (string, error) {
 	var out strings.Builder
 
-	pushed, err := m.pushLocalGit(ctx, source)
+	pushed, err := m.pushLocalGit(ctx)
 	if err != nil {
 		return pushed, err
 	}
