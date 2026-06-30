@@ -51,7 +51,7 @@ type Gitops struct {
 	// +private
 	GoogleCredentials *dagger.Secret
 	// +private
-	K8sService *dagger.Service
+	KubernetesService *dagger.Service
 	// +private
 	GitService *dagger.Service
 	// +private
@@ -119,8 +119,8 @@ func New(
 
 	// +optional
 	// Kubernetes API service (e.g. k3d API).
-	// Set via .env: K8S_SERVICE=tcp://localhost:6550
-	k8sService *dagger.Service,
+	// Set via .env: KUBERNETES_SERVICE=tcp://localhost:6550
+	kubernetesService *dagger.Service,
 
 	// +optional
 	// In-cluster Git mirror service.
@@ -146,7 +146,7 @@ func New(
 		KubeconformIgnores: kubeconformIgnores,
 		GithubToken:        githubToken,
 		GoogleCredentials:  googleCredentials,
-		K8sService:         k8sService,
+		KubernetesService:  kubernetesService,
 		GitService:         gitService,
 		Kubeconfig:         kubeconfig,
 	}
@@ -164,7 +164,7 @@ func (m *Gitops) kubeClient() *dagger.Container {
 		From("fluxcd/flux-cli:v2.8.6").
 		WithUser("root").
 		WithExec([]string{"apk", "add", "--no-cache", "git", "rsync"}).
-		WithServiceBinding("kubernetes", m.K8sService).
+		WithServiceBinding("kubernetes", m.KubernetesService).
 		WithMountedSecret("/tmp/kubeconfig", m.Kubeconfig, dagger.ContainerWithMountedSecretOpts{Mode: 0444}).
 		WithExec([]string{"sh", "-c", "sed 's#https://127\\.0\\.0\\.1:6550#https://kubernetes:6550#g' /tmp/kubeconfig > /tmp/kubeconfig.docker"}).
 		WithEnvVariable("KUBECONFIG", "/tmp/kubeconfig.docker")
