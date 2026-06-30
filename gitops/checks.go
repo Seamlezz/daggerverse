@@ -5,7 +5,6 @@ import (
 	"embed"
 
 	checks "dagger/gitops/check"
-	"dagger/gitops/internal/dagger"
 )
 
 //go:embed scripts/check/*
@@ -25,75 +24,54 @@ func (m *Gitops) checkRunner() checks.Runner {
 // +check
 func (m *Gitops) CheckKustomizeBuild(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckKustomizeBuild(ctx, source)
+	return m.checkRunner().CheckKustomizeBuild(ctx, m.Source)
 }
 
 // CheckKubeconform validates rendered manifests against core and CRD schemas.
 // +check
 func (m *Gitops) CheckKubeconform(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckKubeconform(ctx, source, m.GoogleCredentials)
+	return m.checkRunner().CheckKubeconform(ctx, m.Source, m.GoogleCredentials)
 }
 
 // CheckFluxIntegrity validates Flux Kustomization paths and dependsOn references.
 // +check
 func (m *Gitops) CheckFluxIntegrity(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckFluxIntegrity(ctx, source)
+	return m.checkRunner().CheckFluxIntegrity(ctx, m.Source)
 }
 
 // CheckSopsDecrypt verifies all encrypted secrets can be decrypted.
 // +check
 func (m *Gitops) CheckSopsDecrypt(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckSopsDecrypt(ctx, source, m.GoogleCredentials)
+	return m.checkRunner().CheckSopsDecrypt(ctx, m.Source, m.GoogleCredentials)
 }
 
 // CheckTerraform validates and format-checks Terraform environments.
 // +check
 func (m *Gitops) CheckTerraform(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckTerraform(ctx, source)
+	return m.checkRunner().CheckTerraform(ctx, m.Source)
 }
 
 // CheckYamlLint lints YAML files.
 // +check
 func (m *Gitops) CheckYamlLint(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckYamlLint(ctx, source)
+	return m.checkRunner().CheckYamlLint(ctx, m.Source)
 }
 
 // CheckHelmReleases dry-runs HelmRelease templates.
 // +check
 func (m *Gitops) CheckHelmReleases(
 	ctx context.Context,
-	// +defaultPath="/"
-	// +ignore=["target", ".git", "docs"]
-	source *dagger.Directory,
 ) error {
-	return m.checkRunner().CheckHelmReleases(ctx, source, m.GoogleCredentials)
+	return m.checkRunner().CheckHelmReleases(ctx, m.Source, m.GoogleCredentials)
 }
