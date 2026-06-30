@@ -189,7 +189,7 @@ func (m *Gitops) pushLocalGit(ctx context.Context, source *dagger.Directory) (st
 		WithExec([]string{"git", "config", "user.email", m.GitUserEmail}).
 		WithExec([]string{"sh", "-c", fmt.Sprintf("rsync -a --delete --exclude .git %s/ .", workspaceDir)}).
 		WithExec([]string{"git", "add", "-A"}).
-		WithExec([]string{"git", "commit", "-m", "chore: sync from Dagger"}).
+		WithExec([]string{"sh", "-c", "git diff --cached --quiet && echo 'nothing to commit' || git commit -m 'chore: sync from Dagger'"}).
 		WithExec([]string{"git", "push", "origin", m.GitBranch}).
 		Stdout(ctx)
 }
