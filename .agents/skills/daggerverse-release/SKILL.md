@@ -62,8 +62,8 @@ main
 
 Known repositories to check after release:
 
-- TypeWriter: `$HOME/Bestanden/TypeWriter/features/v1/dagger.json`, branch `develop`.
-- Infrastructure v3: `$HOME/Bestanden/Infrastructure/v3/dagger.json`, branch `v3`.
+- TypeWriter: `$HOME/Bestanden/TypeWriter/features/v1/dagger.json`.
+- Infrastructure v3: `$HOME/Bestanden/Infrastructure/v3/dagger.json`.
 
 Each `dagger.json` can have a `toolchains` array entry with `source` and `pin` fields:
 
@@ -85,8 +85,6 @@ Update both `source` tag and `pin` full commit hash to new release.
 If known dependent repository has no matching entry, do not edit it. Report it as skipped.
 
 If user supplies extra dependent repositories, apply same matching rule unless user explicitly asks to add new entry.
-
-If target file is ignored, edit it directly. Do not stage, commit, or push dependent repository changes. TypeWriter often ignores `features/v1` in `.git/info/exclude`.
 
 ## Required Process
 
@@ -183,13 +181,11 @@ git rev-parse HEAD
 
 For each dependent repository listed above, plus any user supplied dependent repository:
 
-1. Switch to expected branch.
-2. Verify working tree status.
-3. Read `dagger.json`.
-4. Find matching toolchain entry for target module.
-5. Skip repository when no matching entry exists.
-6. Edit `source` tag and `pin` hash to new release.
-7. Show resulting diff for target `dagger.json`.
+0. Read `dagger.json`.
+0. Find matching toolchain entry for target module.
+0. Skip repository when no matching entry exists.
+0. Edit `source` tag and `pin` hash to new release.
+0. Show resulting diff for target `dagger.json`.
 
 Do not stage, commit, or push dependent repository changes unless user explicitly asks.
 
