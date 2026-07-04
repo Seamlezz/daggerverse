@@ -221,6 +221,7 @@ func (m *Wash) Publish(
 	componentDir string,
 
 	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
+	// +optional
 	registry string,
 
 	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
@@ -293,6 +294,7 @@ func (m *Wash) PublishComponents(
 	componentDirs []string,
 
 	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
+	// +optional
 	registry string,
 
 	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
