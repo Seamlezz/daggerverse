@@ -31,6 +31,18 @@ build:
 
 When `.wash/config.yaml` contains `wit.skip_fetch: true`, the module runs `wash build --skip-fetch`; otherwise it runs plain `wash build`.
 
+## Caching
+
+The module uses Dagger cache volumes for Cargo downloads and component build output:
+
+- `/usr/local/cargo/registry`
+- `/usr/local/cargo/git`
+- `/workspace/<component>/target`
+
+The final wasm artifact is copied to `/wash-artifacts` before being returned or pushed, so `target` can remain a cache mount.
+
+The default Rust image remains `rust:latest`; callers can still pass `--rust-image` if they want stricter reproducibility.
+
 ## Build one component
 
 Run Dagger from the workspace/repository root, or use `--root-dir` to select a subdirectory of the current workspace.

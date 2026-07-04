@@ -12,7 +12,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const workspaceDir = "/workspace"
+const (
+	workspaceDir = "/workspace"
+	artifactDir  = "/wash-artifacts"
+
+	cargoRegistryCache = "wash-cargo-registry"
+	cargoGitCache      = "wash-cargo-git"
+)
 
 // Wash is a reusable Dagger module for wasmCloud wash workflows.
 // It provides a wash/Rust toolchain plus helpers to build and publish wasmCloud components.
@@ -70,6 +76,8 @@ func New(
 func (m *Wash) Container() *dagger.Container {
 	return dag.Container().
 		From(m.RustImage).
+		WithMountedCache("/usr/local/cargo/registry", dag.CacheVolume(cargoRegistryCache)).
+		WithMountedCache("/usr/local/cargo/git", dag.CacheVolume(cargoGitCache)).
 		WithExec([]string{"sh", "-c", "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*"}).
 		WithExec([]string{"rustup", "target", "add", "wasm32-wasip2"}).
 		WithEnvVariable("WASH_VERSION", normalizedWashVersion(m.WashVersion)).
@@ -78,8 +86,12 @@ func (m *Wash) Container() *dagger.Container {
 }
 
 func (m *Wash) componentContainer(componentDir string) *dagger.Container {
+	componentDir = cleanComponentDir(componentDir)
+	targetDir := path.Join(workspaceDir, componentDir, "target")
+
 	return m.Container().
 		WithDirectory(workspaceDir, m.Source).
+		WithMountedCache(targetDir, dag.CacheVolume(targetCacheKey(componentDir))).
 		WithWorkdir(path.Join(workspaceDir, componentDir))
 }
 
@@ -126,6 +138,29 @@ func (m *Wash) buildArgs(ctx context.Context, componentDir string) ([]string, er
 	return args, nil
 }
 
+func (m *Wash) buildContainer(ctx context.Context, componentDir string) (*dagger.Container, string, error) {
+	componentDir = cleanComponentDir(componentDir)
+
+	artifactPath, err := m.artifactPath(ctx, componentDir)
+	if err != nil {
+		return nil, "", err
+	}
+
+	buildArgs, err := m.buildArgs(ctx, componentDir)
+	if err != nil {
+		return nil, "", err
+	}
+
+	outputPath := path.Join(artifactDir, path.Base(artifactPath))
+	copyArtifact := fmt.Sprintf("mkdir -p %q && cp %q %q", path.Dir(outputPath), artifactPath, outputPath)
+
+	c := m.componentContainer(componentDir).
+		WithExec(buildArgs).
+		WithExec([]string{"sh", "-c", copyArtifact})
+
+	return c, outputPath, nil
+}
+
 func (m *Wash) resolveComponentDirs(ctx context.Context, componentDirs []string) ([]string, error) {
 	if len(componentDirs) > 0 {
 		resolved := make([]string, 0, len(componentDirs))
@@ -170,21 +205,12 @@ func (m *Wash) Build(
 	// +default="."
 	componentDir string,
 ) (*dagger.File, error) {
-	componentDir = cleanComponentDir(componentDir)
-	artifactPath, err := m.artifactPath(ctx, componentDir)
+	c, outputPath, err := m.buildContainer(ctx, componentDir)
 	if err != nil {
 		return nil, err
 	}
 
-	buildArgs, err := m.buildArgs(ctx, componentDir)
-	if err != nil {
-		return nil, err
-	}
-
-	c := m.componentContainer(componentDir).
-		WithExec(buildArgs)
-
-	return c.File(artifactPath), nil
+	return c.File(outputPath), nil
 }
 
 // BuildComponents builds multiple component directories and returns all wasm artifacts.
@@ -275,20 +301,13 @@ func (m *Wash) Publish(
 		return "", err
 	}
 
-	artifactPath, err := m.artifactPath(ctx, componentDir)
-	if err != nil {
-		return "", err
-	}
-
-	buildArgs, err := m.buildArgs(ctx, componentDir)
-	if err != nil {
-		return "", err
-	}
-
 	refs := refsFor(base, tag)
-	c := m.componentContainer(componentDir).
-		WithServiceBinding(registryHostname, registry).
-		WithExec(buildArgs)
+	c, artifactPath, err := m.buildContainer(ctx, componentDir)
+	if err != nil {
+		return "", err
+	}
+
+	c = c.WithServiceBinding(registryHostname, registry)
 	c = publishRefs(c, refs, artifactPath, username, password, insecure)
 
 	if _, err := c.Sync(ctx); err != nil {
@@ -370,6 +389,16 @@ func cleanComponentDir(componentDir string) string {
 		return "."
 	}
 	return strings.TrimPrefix(path.Clean(componentDir), "/")
+}
+
+func targetCacheKey(componentDir string) string {
+	componentDir = cleanComponentDir(componentDir)
+	if componentDir == "." {
+		return "wash-target-root"
+	}
+
+	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-", " ", "_")
+	return "wash-target-" + replacer.Replace(componentDir)
 }
 
 func imageBase(
