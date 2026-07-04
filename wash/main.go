@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"dagger/wash/internal/dagger"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -222,7 +223,7 @@ func (m *Wash) Publish(
 
 	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
 	// +optional
-	registry string,
+	registry *dagger.Service,
 
 	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
 	// +optional
@@ -254,7 +255,7 @@ func (m *Wash) Publish(
 		componentName = path.Base(componentDir)
 	}
 
-	base, err := imageBase(registry, repository, componentName)
+	base, err := imageBase(ctx, registry, repository, componentName)
 	if err != nil {
 		return "", err
 	}
@@ -295,7 +296,7 @@ func (m *Wash) PublishComponents(
 
 	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
 	// +optional
-	registry string,
+	registry *dagger.Service,
 
 	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
 	// +optional
@@ -354,21 +355,32 @@ func cleanComponentDir(componentDir string) string {
 	return strings.TrimPrefix(path.Clean(componentDir), "/")
 }
 
-func imageBase(registry, repository, componentName string) (string, error) {
-	registry = strings.Trim(strings.TrimSpace(registry), "/")
+func imageBase(
+	ctx context.Context,
+	registry *dagger.Service,
+	repository, componentName string,
+) (string, error) {
+	registryHostname, err := registry.Hostname(ctx)
+	if err != nil {
+		return "", err
+	}
+	registryHostname = strings.Trim(strings.TrimSpace(registryHostname), "/")
 	repository = strings.Trim(strings.TrimSpace(repository), "/")
 	componentName = strings.Trim(strings.TrimSpace(componentName), "/")
 
-	if registry == "" {
+	if registryHostname == "" {
 		return "", fmt.Errorf("registry is required")
 	}
 	if componentName == "" || componentName == "." {
 		return "", fmt.Errorf("componentName is required when componentDir has no basename")
 	}
-	if repository == "" {
-		return registry + "/" + componentName, nil
+
+	url := registryHostname
+	if repository != "" {
+		url += "/" + repository
 	}
-	return registry + "/" + repository + "/" + componentName, nil
+	url += "/" + componentName
+	return url, nil
 }
 
 func refsFor(base, tag string) []string {
