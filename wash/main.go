@@ -225,6 +225,10 @@ func (m *Wash) Publish(
 	// +optional
 	registry *dagger.Service,
 
+	// Registry hostname that the client should use
+	// +optional
+	registryHostname string,
+
 	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
 	// +optional
 	repository string,
@@ -255,7 +259,15 @@ func (m *Wash) Publish(
 		componentName = path.Base(componentDir)
 	}
 
-	base, err := imageBase(ctx, registry, repository, componentName)
+	if registryHostname == "" {
+		var err error
+		registryHostname, err = registry.Endpoint(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	base, err := imageBase(ctx, registryHostname, repository, componentName)
 	if err != nil {
 		return "", err
 	}
@@ -275,6 +287,7 @@ func (m *Wash) Publish(
 
 	refs := refsFor(base, tag)
 	c := m.componentContainer(componentDir).
+		WithServiceBinding(registryHostname, registry).
 		WithExec(buildArgs)
 	c = publishRefs(c, refs, artifactPath, username, password, insecure)
 
@@ -297,6 +310,10 @@ func (m *Wash) PublishComponents(
 	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
 	// +optional
 	registry *dagger.Service,
+
+	// Registry hostname that the client should use
+	// +optional
+	registryHostname string,
 
 	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
 	// +optional
@@ -326,7 +343,7 @@ func (m *Wash) PublishComponents(
 
 	var pushed []string
 	for _, componentDir := range resolvedDirs {
-		refs, err := m.Publish(ctx, componentDir, registry, repository, path.Base(componentDir), tag, username, password, insecure)
+		refs, err := m.Publish(ctx, componentDir, registry, registryHostname, repository, path.Base(componentDir), tag, username, password, insecure)
 		if err != nil {
 			return strings.Join(pushed, "\n"), err
 		}
@@ -357,25 +374,21 @@ func cleanComponentDir(componentDir string) string {
 
 func imageBase(
 	ctx context.Context,
-	registry *dagger.Service,
+	registry string,
 	repository, componentName string,
 ) (string, error) {
-	registryHostname, err := registry.Hostname(ctx)
-	if err != nil {
-		return "", err
-	}
-	registryHostname = strings.Trim(strings.TrimSpace(registryHostname), "/")
+	registry = strings.Trim(strings.TrimSpace(registry), "/")
 	repository = strings.Trim(strings.TrimSpace(repository), "/")
 	componentName = strings.Trim(strings.TrimSpace(componentName), "/")
 
-	if registryHostname == "" {
+	if registry == "" {
 		return "", fmt.Errorf("registry is required")
 	}
 	if componentName == "" || componentName == "." {
 		return "", fmt.Errorf("componentName is required when componentDir has no basename")
 	}
 
-	url := registryHostname
+	url := registry
 	if repository != "" {
 		url += "/" + repository
 	}
