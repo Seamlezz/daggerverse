@@ -85,14 +85,20 @@ func (m *Wash) Container() *dagger.Container {
 		WithExec([]string{"wash", "--version"})
 }
 
-func (m *Wash) componentContainer(componentDir string) *dagger.Container {
+func (m *Wash) componentContainer(ctx context.Context, componentDir string) (*dagger.Container, error) {
 	componentDir = cleanComponentDir(componentDir)
-	targetDir := path.Join(workspaceDir, componentDir, "target")
+
+	cfg, err := m.loadConfig(ctx, componentDir)
+	if err != nil {
+		return nil, err
+	}
+
+	targetDir := targetCacheMountPath(componentDir, cfg.Build.ComponentPath)
 
 	return m.Container().
 		WithDirectory(workspaceDir, m.Source).
 		WithMountedCache(targetDir, dag.CacheVolume(targetCacheKey(componentDir))).
-		WithWorkdir(path.Join(workspaceDir, componentDir))
+		WithWorkdir(path.Join(workspaceDir, componentDir)), nil
 }
 
 func (m *Wash) loadConfig(ctx context.Context, componentDir string) (washConfig, error) {
@@ -111,6 +117,24 @@ func (m *Wash) loadConfig(ctx context.Context, componentDir string) (washConfig,
 	return cfg, nil
 }
 
+func resolveArtifactPath(componentDir string, componentPath string) string {
+	componentDir = cleanComponentDir(componentDir)
+	return path.Clean(path.Join(workspaceDir, componentDir, componentPath))
+}
+
+func targetCacheMountPath(componentDir string, componentPath string) string {
+	componentDir = cleanComponentDir(componentDir)
+	artifactPath := resolveArtifactPath(componentDir, componentPath)
+
+	for dir := path.Dir(artifactPath); dir != "." && dir != "/"; dir = path.Dir(dir) {
+		if path.Base(dir) == "target" {
+			return dir
+		}
+	}
+
+	return path.Join(workspaceDir, componentDir, "target")
+}
+
 func (m *Wash) artifactPath(ctx context.Context, componentDir string) (string, error) {
 	componentDir = cleanComponentDir(componentDir)
 	configPath := path.Join(componentDir, ".wash", "config.yaml")
@@ -122,7 +146,7 @@ func (m *Wash) artifactPath(ctx context.Context, componentDir string) (string, e
 		return "", fmt.Errorf("%s is missing build.component_path", configPath)
 	}
 
-	return path.Clean(path.Join(workspaceDir, componentDir, cfg.Build.ComponentPath)), nil
+	return resolveArtifactPath(componentDir, cfg.Build.ComponentPath), nil
 }
 
 func (m *Wash) buildArgs(ctx context.Context, componentDir string) ([]string, error) {
@@ -154,7 +178,12 @@ func (m *Wash) buildContainer(ctx context.Context, componentDir string) (*dagger
 	outputPath := path.Join(artifactDir, path.Base(artifactPath))
 	copyArtifact := fmt.Sprintf("mkdir -p %q && cp %q %q", path.Dir(outputPath), artifactPath, outputPath)
 
-	c := m.componentContainer(componentDir).
+	c, err := m.componentContainer(ctx, componentDir)
+	if err != nil {
+		return nil, "", err
+	}
+
+	c = c.
 		WithExec(buildArgs).
 		WithExec([]string{"sh", "-c", copyArtifact})
 

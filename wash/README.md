@@ -37,9 +37,27 @@ The module uses Dagger cache volumes for Cargo downloads and component build out
 
 - `/usr/local/cargo/registry`
 - `/usr/local/cargo/git`
-- `/workspace/<component>/target`
+- the nearest `target` directory above `build.component_path`, resolved from `.wash/config.yaml`
 
-The final wasm artifact is copied to `/wash-artifacts` before being returned or pushed, so `target` can remain a cache mount.
+For a component-local artifact path such as:
+
+```yaml
+build:
+  component_path: target/wasm32-wasip2/release/my_component.wasm
+```
+
+this mounts `/workspace/<component>/target`.
+
+For a workspace-level artifact path such as:
+
+```yaml
+build:
+  component_path: ../../target/wasm32-wasip2/release/auth_callout.wasm
+```
+
+this mounts `/workspace/target`.
+
+The final wasm artifact is copied to `/wash-artifacts` before being returned or pushed, so `target` can remain a cache mount. Cache volume keys are still per component.
 
 The default Rust image remains `rust:latest`; callers can still pass `--rust-image` if they want stricter reproducibility.
 
