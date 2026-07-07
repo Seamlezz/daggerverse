@@ -9,7 +9,6 @@ import (
 
 	"dagger/wash/internal/dagger"
 
-	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 )
 
@@ -50,7 +49,7 @@ func New(
 
 	// RootDir selects the source subdirectory mounted as /workspace.
 	// +optional
-	// +default="."
+	// +default="/"
 	rootDir string,
 
 	// WashVersion pins the wash CLI version installed in the toolchain.
@@ -240,53 +239,6 @@ func (m *Wash) BuildComponents(
 	return out, nil
 }
 
-// publishContainer prepares a container with wash build and oci push commands.
-// The caller must Sync the returned container to execute the build and push.
-func (m *Wash) publishContainer(
-	ctx context.Context,
-	componentDir string,
-	registry *dagger.Service,
-	registryHostname string,
-	repository string,
-	componentName string,
-	tag string,
-	username string,
-	password *dagger.Secret,
-	insecure bool,
-) (*dagger.Container, []string, error) {
-	componentDir = cleanComponentDir(componentDir)
-	if strings.TrimSpace(componentName) == "" {
-		componentName = path.Base(componentDir)
-	}
-
-	if registryHostname == "" {
-		var err error
-		registryHostname, err = registry.Endpoint(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	base, err := imageBase(ctx, registryHostname, repository, componentName)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := validateCredentials(username, password); err != nil {
-		return nil, nil, err
-	}
-
-	refs := refsFor(base, tag)
-	c, artifactPath, err := m.buildContainer(ctx, componentDir)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	c = c.WithServiceBinding(registryHostname, registry)
-	c = publishRefs(c, refs, artifactPath, username, password, insecure)
-
-	return c, refs, nil
-}
-
 // Publish builds and pushes one wasmCloud component OCI artifact.
 func (m *Wash) Publish(
 	ctx context.Context,
@@ -328,11 +280,35 @@ func (m *Wash) Publish(
 	// +default=false
 	insecure bool,
 ) (string, error) {
-	c, refs, err := m.publishContainer(ctx, componentDir, registry, registryHostname,
-		repository, componentName, tag, username, password, insecure)
+	componentDir = cleanComponentDir(componentDir)
+	if strings.TrimSpace(componentName) == "" {
+		componentName = path.Base(componentDir)
+	}
+
+	if registryHostname == "" {
+		var err error
+		registryHostname, err = registry.Endpoint(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	base, err := imageBase(ctx, registryHostname, repository, componentName)
 	if err != nil {
 		return "", err
 	}
+	if err := validateCredentials(username, password); err != nil {
+		return "", err
+	}
+
+	refs := refsFor(base, tag)
+	c, artifactPath, err := m.buildContainer(ctx, componentDir)
+	if err != nil {
+		return "", err
+	}
+
+	c = c.WithServiceBinding(registryHostname, registry)
+	c = publishRefs(c, refs, artifactPath, username, password, insecure)
 
 	if _, err := c.Sync(ctx); err != nil {
 		return "", err
@@ -343,7 +319,6 @@ func (m *Wash) Publish(
 
 // PublishComponents builds and pushes multiple components using directory basenames as image names.
 // If componentDirs is empty, components are discovered by **/.wash/config.yaml.
-// All components are built and pushed concurrently.
 func (m *Wash) PublishComponents(
 	ctx context.Context,
 	// ComponentDirs are component directories relative to the module source root.
@@ -385,45 +360,16 @@ func (m *Wash) PublishComponents(
 		return "", err
 	}
 
-	// Phase 1: Build all DAGs lazily — no execution yet.
-	type publishJob struct {
-		dir  string
-		refs []string
-		c    *dagger.Container
-	}
-	jobs := make([]publishJob, 0, len(resolvedDirs))
-	for _, dir := range resolvedDirs {
-		c, refs, err := m.publishContainer(ctx, dir, registry, registryHostname,
-			repository, path.Base(dir), tag, username, password, insecure)
+	var pushed []string
+	for _, componentDir := range resolvedDirs {
+		refs, err := m.Publish(ctx, componentDir, registry, registryHostname, repository, path.Base(componentDir), tag, username, password, insecure)
 		if err != nil {
-			return "", err
+			return strings.Join(pushed, "\n"), err
 		}
-		jobs = append(jobs, publishJob{dir: dir, refs: refs, c: c})
+		pushed = append(pushed, refs)
 	}
 
-	// Phase 2: Execute all DAGs concurrently.
-	g, ctx := errgroup.WithContext(ctx)
-	for _, j := range jobs {
-		j := j // capture loop variable
-		g.Go(func() error {
-			if _, err := j.c.Sync(ctx); err != nil {
-				return fmt.Errorf("%s: %w", j.dir, err)
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return "", err
-	}
-
-	// Phase 3: Collect pre-computed refs.
-	// Refs are deterministic (registry + repository + componentName + tag),
-	// so it is safe to return them after sync succeeds.
-	var all []string
-	for _, j := range jobs {
-		all = append(all, strings.Join(j.refs, "\n"))
-	}
-	return strings.Join(all, "\n"), nil
+	return strings.Join(pushed, "\n"), nil
 }
 
 func normalizedWashVersion(version string) string {
