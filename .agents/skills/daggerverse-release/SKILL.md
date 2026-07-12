@@ -62,7 +62,7 @@ main
 
 Known repositories to check after release:
 
-- TypeWriter: `$HOME/Bestanden/TypeWriter/features/v1/dagger.json`.
+- TypeWriter: `$HOME/Bestanden/TypewriterV1/dagger.json`.
 - Infrastructure v3: `$HOME/Bestanden/Infrastructure/v3/dagger.json`.
 
 Each `dagger.json` can have a `toolchains` array entry with `source` and `pin` fields:
