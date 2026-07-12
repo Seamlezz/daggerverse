@@ -16,6 +16,9 @@ type ContainerFactory func(opts ...dagger.ContainerOpts) *dagger.Container
 
 // Config holds all configuration for the check runner.
 type Config struct {
+	// ClusterDir is the root directory containing Flux cluster definitions.
+	ClusterDir string
+
 	// Clusters overrides auto-discovered Flux cluster names.
 	Clusters []string
 
@@ -44,6 +47,7 @@ type Config struct {
 // DefaultConfig returns sensible defaults for all config fields.
 func DefaultConfig() Config {
 	return Config{
+		ClusterDir:         "clusters",
 		KubeVersion:        "1.33.0",
 		KubeconformSkips:   []string{"CustomResourceDefinition", "VaultDynamicSecret"},
 		KubeconformIgnores: []string{"gotk-components", "gotk-sync"},
@@ -74,7 +78,7 @@ func NewRunner(newContainer ContainerFactory, fsys fs.FS, scriptDir string, vers
 
 // resolveClusters returns configured clusters or auto-discovers them.
 func (r Runner) resolveClusters(ctx context.Context, source *dagger.Directory) ([]string, error) {
-	return resolveClusters(ctx, source, r.config.Clusters)
+	return resolveClusters(ctx, source, r.config.ClusterDir, r.config.Clusters)
 }
 
 // discoverTerraformEnvs finds directories containing Terraform root modules.
@@ -188,7 +192,7 @@ func (r Runner) CheckKustomizeBuild(ctx context.Context, source *dagger.Director
 	if err != nil {
 		return err
 	}
-	paths, err := discoverFluxKustomizePaths(ctx, source, clusters)
+	paths, err := discoverFluxKustomizePaths(ctx, source, r.config.ClusterDir, clusters)
 	if err != nil {
 		return err
 	}
@@ -206,7 +210,7 @@ func (r Runner) CheckKubeconform(ctx context.Context, source *dagger.Directory, 
 	if err != nil {
 		return err
 	}
-	paths, err := discoverFluxKustomizePaths(ctx, source, clusters)
+	paths, err := discoverFluxKustomizePaths(ctx, source, r.config.ClusterDir, clusters)
 	if err != nil {
 		return err
 	}
@@ -219,10 +223,11 @@ func (r Runner) CheckKubeconform(ctx context.Context, source *dagger.Directory, 
 	c = c.WithExec([]string{"mkdir", "-p", "/tmp/schemas/flux", "/tmp/schemas/helm"})
 
 	// Extract Flux CRDs from gotk-components.yaml if it exists
+	c = c.WithEnvVariable("CLUSTER_DIR", r.config.ClusterDir)
 	c = c.WithExec([]string{"sh", "-c",
-		"for f in /src/clusters/*/flux-system/gotk-components.yaml; do " +
-			"[ -f \"$f\" ] && python3 /usr/local/bin/extract-crd-schemas.py /tmp/schemas/flux \"$f\"; " +
-			"done"})
+		"for f in \"/src/$CLUSTER_DIR\"/*/flux-system/gotk-components.yaml; do " +
+			"if [ -f \"$f\" ]; then python3 /usr/local/bin/extract-crd-schemas.py /tmp/schemas/flux \"$f\"; fi; " +
+			"done; exit 0"})
 
 	// Set source dirs as env vars for scripts
 	helmDirs, _ := r.resolveHelmSourceDirs(ctx, source)
@@ -249,7 +254,7 @@ func (r Runner) CheckFluxIntegrity(ctx context.Context, source *dagger.Directory
 	if err != nil {
 		return err
 	}
-	return validateFluxIntegrity(ctx, source, clusters)
+	return validateFluxIntegrity(ctx, source, r.config.ClusterDir, clusters)
 }
 
 func (r Runner) CheckSopsDecrypt(ctx context.Context, source *dagger.Directory, googleCredentials *dagger.Secret) error {
@@ -310,7 +315,7 @@ func (r Runner) CheckHelmReleases(ctx context.Context, source *dagger.Directory,
 	if err != nil {
 		return err
 	}
-	paths, err := discoverFluxKustomizePaths(ctx, source, clusters)
+	paths, err := discoverFluxKustomizePaths(ctx, source, r.config.ClusterDir, clusters)
 	if err != nil {
 		return err
 	}

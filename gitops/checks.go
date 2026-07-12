@@ -12,6 +12,7 @@ var checkScriptFS embed.FS
 
 func (m *Gitops) checkRunner() checks.Runner {
 	config := checks.Config{
+		ClusterDir:         m.ClusterDir,
 		Clusters:           m.Clusters,
 		KubeVersion:        m.KubeVersion,
 		KubeconformSkips:   m.KubeconformSkips,

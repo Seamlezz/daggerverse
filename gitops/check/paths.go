@@ -33,12 +33,12 @@ type fluxKustomization struct {
 	Spec       fluxKustomizationSpec     `yaml:"spec"`
 }
 
-// discoverClusters returns cluster names by listing subdirectories of clusters/.
-// If the clusters/ directory does not exist, returns nil.
-func discoverClusters(ctx context.Context, source *dagger.Directory) ([]string, error) {
-	entries, err := source.Directory("clusters").Entries(ctx)
+// discoverClusters returns cluster names by listing subdirectories of clusterDir.
+// If clusterDir does not exist, returns nil.
+func discoverClusters(ctx context.Context, source *dagger.Directory, clusterDir string) ([]string, error) {
+	entries, err := source.Directory(clusterDir).Entries(ctx)
 	if err != nil {
-		// clusters/ directory doesn't exist — no clusters to discover
+		// Cluster directory does not exist.
 		return nil, nil
 	}
 	var clusters []string
@@ -51,15 +51,15 @@ func discoverClusters(ctx context.Context, source *dagger.Directory) ([]string, 
 }
 
 // resolveClusters returns the configured clusters if set, otherwise auto-discovers.
-func resolveClusters(ctx context.Context, source *dagger.Directory, configured []string) ([]string, error) {
+func resolveClusters(ctx context.Context, source *dagger.Directory, clusterDir string, configured []string) ([]string, error) {
 	if len(configured) > 0 {
 		return configured, nil
 	}
-	return discoverClusters(ctx, source)
+	return discoverClusters(ctx, source, clusterDir)
 }
 
-func discoverFluxKustomizePaths(ctx context.Context, source *dagger.Directory, clusters []string) ([]string, error) {
-	kustomizations, err := collectFluxKustomizations(ctx, source, clusters)
+func discoverFluxKustomizePaths(ctx context.Context, source *dagger.Directory, clusterDir string, clusters []string) ([]string, error) {
+	kustomizations, err := collectFluxKustomizations(ctx, source, clusterDir, clusters)
 	if err != nil {
 		return nil, err
 	}
@@ -88,10 +88,10 @@ func normalizeFluxPath(p string) string {
 	return strings.TrimPrefix(p, "./")
 }
 
-func collectFluxKustomizations(ctx context.Context, source *dagger.Directory, clusters []string) ([]fluxKustomization, error) {
+func collectFluxKustomizations(ctx context.Context, source *dagger.Directory, clusterDir string, clusters []string) ([]fluxKustomization, error) {
 	var out []fluxKustomization
 	for _, cluster := range clusters {
-		kustomizations, err := collectFluxKustomizationsForCluster(ctx, source, cluster)
+		kustomizations, err := collectFluxKustomizationsForCluster(ctx, source, clusterDir, cluster)
 		if err != nil {
 			return nil, err
 		}
@@ -123,10 +123,10 @@ func isFluxKustomization(doc fluxKustomization) bool {
 	return doc.Kind == "Kustomization" && doc.APIVersion == "kustomize.toolkit.fluxcd.io/v1"
 }
 
-func validateFluxIntegrity(ctx context.Context, source *dagger.Directory, clusters []string) error {
+func validateFluxIntegrity(ctx context.Context, source *dagger.Directory, clusterDir string, clusters []string) error {
 	var errs []string
 	for _, cluster := range clusters {
-		clusterErrs, err := validateFluxCluster(ctx, source, cluster)
+		clusterErrs, err := validateFluxCluster(ctx, source, clusterDir, cluster)
 		if err != nil {
 			return err
 		}
@@ -139,23 +139,23 @@ func validateFluxIntegrity(ctx context.Context, source *dagger.Directory, cluste
 	return nil
 }
 
-func validateFluxCluster(ctx context.Context, source *dagger.Directory, cluster string) ([]string, error) {
-	kustomizations, err := collectFluxKustomizationsForCluster(ctx, source, cluster)
+func validateFluxCluster(ctx context.Context, source *dagger.Directory, clusterDir, cluster string) ([]string, error) {
+	kustomizations, err := collectFluxKustomizationsForCluster(ctx, source, clusterDir, cluster)
 	if err != nil {
 		return nil, err
 	}
 
-	names, errs := collectKustomizationNames(cluster, kustomizations)
-	pathErrs, err := validateKustomizationPaths(ctx, source, cluster, kustomizations)
+	names, errs := collectKustomizationNames(clusterDir, cluster, kustomizations)
+	pathErrs, err := validateKustomizationPaths(ctx, source, clusterDir, cluster, kustomizations)
 	if err != nil {
 		return nil, err
 	}
 	errs = append(errs, pathErrs...)
-	errs = append(errs, validateKustomizationDependencies(cluster, kustomizations, names)...)
+	errs = append(errs, validateKustomizationDependencies(clusterDir, cluster, kustomizations, names)...)
 	return errs, nil
 }
 
-func collectKustomizationNames(cluster string, kustomizations []fluxKustomization) (map[string]struct{}, []string) {
+func collectKustomizationNames(clusterDir, cluster string, kustomizations []fluxKustomization) (map[string]struct{}, []string) {
 	names := map[string]struct{}{}
 	var errs []string
 	for _, ks := range kustomizations {
@@ -164,7 +164,7 @@ func collectKustomizationNames(cluster string, kustomizations []fluxKustomizatio
 			continue
 		}
 		if _, exists := names[name]; exists {
-			errs = append(errs, fmt.Sprintf("clusters/%s: duplicate Flux Kustomization name: %s", cluster, name))
+			errs = append(errs, fmt.Sprintf("%s/%s: duplicate Flux Kustomization name: %s", clusterDir, cluster, name))
 			continue
 		}
 		names[name] = struct{}{}
@@ -172,12 +172,12 @@ func collectKustomizationNames(cluster string, kustomizations []fluxKustomizatio
 	return names, errs
 }
 
-func validateKustomizationPaths(ctx context.Context, source *dagger.Directory, cluster string, kustomizations []fluxKustomization) ([]string, error) {
+func validateKustomizationPaths(ctx context.Context, source *dagger.Directory, clusterDir, cluster string, kustomizations []fluxKustomization) ([]string, error) {
 	var errs []string
 	for _, ks := range kustomizations {
 		p := normalizeFluxPath(ks.Spec.Path)
 		if p == "" {
-			errs = append(errs, fmt.Sprintf("clusters/%s: Kustomization/%s has empty spec.path", cluster, ks.Metadata.Name))
+			errs = append(errs, fmt.Sprintf("%s/%s: Kustomization/%s has empty spec.path", clusterDir, cluster, ks.Metadata.Name))
 			continue
 		}
 		ok, err := source.Directory(p).Exists(ctx, ".")
@@ -185,13 +185,13 @@ func validateKustomizationPaths(ctx context.Context, source *dagger.Directory, c
 			return nil, err
 		}
 		if !ok {
-			errs = append(errs, fmt.Sprintf("clusters/%s: missing spec.path for Kustomization/%s: %s", cluster, ks.Metadata.Name, p))
+			errs = append(errs, fmt.Sprintf("%s/%s: missing spec.path for Kustomization/%s: %s", clusterDir, cluster, ks.Metadata.Name, p))
 		}
 	}
 	return errs, nil
 }
 
-func validateKustomizationDependencies(cluster string, kustomizations []fluxKustomization, names map[string]struct{}) []string {
+func validateKustomizationDependencies(clusterDir, cluster string, kustomizations []fluxKustomization, names map[string]struct{}) []string {
 	var errs []string
 	for _, ks := range kustomizations {
 		for _, dep := range ks.Spec.DependsOn {
@@ -201,15 +201,15 @@ func validateKustomizationDependencies(cluster string, kustomizations []fluxKust
 			if _, ok := names[dep.Name]; ok {
 				continue
 			}
-			errs = append(errs, fmt.Sprintf("clusters/%s: Kustomization/%s dependsOn unknown target: %s", cluster, ks.Metadata.Name, dep.Name))
+			errs = append(errs, fmt.Sprintf("%s/%s: Kustomization/%s dependsOn unknown target: %s", clusterDir, cluster, ks.Metadata.Name, dep.Name))
 		}
 	}
 	return errs
 }
 
-func collectFluxKustomizationsForCluster(ctx context.Context, source *dagger.Directory, cluster string) ([]fluxKustomization, error) {
+func collectFluxKustomizationsForCluster(ctx context.Context, source *dagger.Directory, clusterRoot, cluster string) ([]fluxKustomization, error) {
 	var out []fluxKustomization
-	clusterDir := source.Directory(path.Join("clusters", cluster))
+	clusterDir := source.Directory(path.Join(clusterRoot, cluster))
 	entries, err := clusterDir.Entries(ctx)
 	if err != nil {
 		return nil, err
@@ -220,11 +220,11 @@ func collectFluxKustomizationsForCluster(ctx context.Context, source *dagger.Dir
 		}
 		content, err := clusterDir.File(entry).Contents(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("read clusters/%s/%s: %w", cluster, entry, err)
+			return nil, fmt.Errorf("read %s/%s/%s: %w", clusterRoot, cluster, entry, err)
 		}
 		docs, err := parseFluxKustomizationDocuments(content)
 		if err != nil {
-			return nil, fmt.Errorf("parse clusters/%s/%s: %w", cluster, entry, err)
+			return nil, fmt.Errorf("parse %s/%s/%s: %w", clusterRoot, cluster, entry, err)
 		}
 		out = append(out, docs...)
 	}

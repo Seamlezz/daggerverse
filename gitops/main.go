@@ -33,6 +33,9 @@ type Gitops struct {
 	// GitUserEmail is the Git committer email for local mirror pushes.
 	GitUserEmail string
 
+	// ClusterDir is the root directory containing Flux cluster definitions.
+	ClusterDir string
+
 	// Clusters overrides auto-discovered Flux cluster names for checks.
 	Clusters []string
 
@@ -91,8 +94,13 @@ func New(
 	gitUserEmail string,
 
 	// +optional
+	// +default="clusters"
+	// Directory containing Flux cluster definitions.
+	clusterDir string,
+
+	// +optional
 	// Cluster names for Flux Kustomization discovery in checks.
-	// Auto-discovered from clusters/ directory if not set.
+	// Auto-discovered from the cluster directory if not set.
 	clusters []string,
 
 	// +optional
@@ -145,6 +153,7 @@ func New(
 		FluxSourceName:     fluxSourceName,
 		GitUserName:        gitUserName,
 		GitUserEmail:       gitUserEmail,
+		ClusterDir:         clusterDir,
 		Clusters:           clusters,
 		KubeVersion:        kubeVersion,
 		KubeconformSkips:   kubeconformSkips,
