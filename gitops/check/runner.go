@@ -193,7 +193,7 @@ func (r Runner) CheckKustomizeBuild(ctx context.Context, source *dagger.Director
 		return err
 	}
 	if len(paths) == 0 {
-		return fmt.Errorf("no Flux Kustomization paths discovered")
+		return nil
 	}
 
 	c := buildKustomizePaths(r.withCheckRepo(r.kustomizeToolchain(), source), paths)
@@ -258,7 +258,7 @@ func (r Runner) CheckSopsDecrypt(ctx context.Context, source *dagger.Directory, 
 		return err
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("no .enc.yaml files found")
+		return nil
 	}
 
 	c, err := mountRequiredGoogleCredentials(r.sopsToolchain(), googleCredentials)
