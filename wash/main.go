@@ -54,7 +54,7 @@ func New(
 
 	// WashVersion pins the wash CLI version installed in the toolchain.
 	// +optional
-	// +default="2.5.1"
+	// +default="2.5.2"
 	washVersion string,
 
 	// RustImage is the base Rust toolchain image.
