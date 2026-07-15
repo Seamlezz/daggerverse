@@ -330,16 +330,11 @@ func (m *Wash) Publish(
 		return "", err
 	}
 
-	refs := refsFor(base, tag)
-	c, artifactPath, err := m.buildContainer(ctx, componentDir)
+	containers, refs, err := m.publishContainers(ctx, componentDir, registry, registryHostname, base, tag, username, password, insecure)
 	if err != nil {
 		return "", err
 	}
-
-	c = c.WithServiceBinding(registryHostname, registry)
-	c = publishRefs(c, refs, artifactPath, username, password, insecure)
-
-	if _, err := c.Sync(ctx); err != nil {
+	if err := syncPublishContainers(ctx, containers); err != nil {
 		return "", err
 	}
 
@@ -389,15 +384,40 @@ func (m *Wash) PublishComponents(
 		return "", err
 	}
 
-	var pushed []string
-	for _, componentDir := range resolvedDirs {
-		refs, err := m.Publish(ctx, componentDir, registry, registryHostname, repository, path.Base(componentDir), tag, username, password, insecure)
+	if registryHostname == "" {
+		registryHostname, err = registry.Endpoint(ctx)
 		if err != nil {
-			return strings.Join(pushed, "\n"), err
+			return "", err
 		}
-		pushed = append(pushed, refs)
+	}
+	if err := validateCredentials(username, password); err != nil {
+		return "", err
 	}
 
+	var containers []*dagger.Container
+	var pushed []string
+	componentByBase := make(map[string]string, len(resolvedDirs))
+	for _, componentDir := range resolvedDirs {
+		base, err := imageBase(ctx, registryHostname, repository, path.Base(componentDir))
+		if err != nil {
+			return "", err
+		}
+		if existing, found := componentByBase[base]; found {
+			return "", fmt.Errorf("components %q and %q resolve to the same OCI image %q", existing, componentDir, base)
+		}
+		componentByBase[base] = componentDir
+
+		componentContainers, refs, err := m.publishContainers(ctx, componentDir, registry, registryHostname, base, tag, username, password, insecure)
+		if err != nil {
+			return "", err
+		}
+		containers = append(containers, componentContainers...)
+		pushed = append(pushed, refs...)
+	}
+
+	if err := syncPublishContainers(ctx, containers); err != nil {
+		return "", err
+	}
 	return strings.Join(pushed, "\n"), nil
 }
 
@@ -473,36 +493,68 @@ func validateCredentials(username string, password *dagger.Secret) error {
 	return nil
 }
 
-func publishRefs(
+func (m *Wash) publishContainers(
+	ctx context.Context,
+	componentDir string,
+	registry *dagger.Service,
+	registryHostname string,
+	base string,
+	tag string,
+	username string,
+	password *dagger.Secret,
+	insecure bool,
+) ([]*dagger.Container, []string, error) {
+	refs := refsFor(base, tag)
+	c, artifactPath, err := m.buildContainer(ctx, componentDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	c = c.WithServiceBinding(registryHostname, registry)
+
+	containers := make([]*dagger.Container, 0, len(refs))
+	for _, ref := range refs {
+		containers = append(containers, publishRef(c, ref, artifactPath, username, password, insecure))
+	}
+	return containers, refs, nil
+}
+
+func publishRef(
 	c *dagger.Container,
-	refs []string,
+	ref string,
 	artifactPath string,
 	username string,
 	password *dagger.Secret,
 	insecure bool,
 ) *dagger.Container {
-	for _, ref := range refs {
-		args := []string{"wash", "oci", "push"}
-		if insecure {
-			args = append(args, "--insecure")
-		}
-
-		if username != "" && password != nil {
-			c = c.
-				WithEnvVariable("WASH_REG_USER", username).
-				WithSecretVariable("WASH_REG_PASSWORD", password)
-			script := fmt.Sprintf(
-				"%s -u \"$WASH_REG_USER\" -p \"$WASH_REG_PASSWORD\" %q %q",
-				strings.Join(args, " "),
-				ref,
-				artifactPath,
-			)
-			c = c.WithExec([]string{"sh", "-c", script})
-			continue
-		}
-
-		args = append(args, ref, artifactPath)
-		c = c.WithExec(args)
+	args := []string{"wash", "oci", "push"}
+	if insecure {
+		args = append(args, "--insecure")
 	}
-	return c
+
+	if username == "" || password == nil {
+		return c.WithExec(append(args, ref, artifactPath))
+	}
+
+	c = c.
+		WithEnvVariable("WASH_REG_USER", username).
+		WithSecretVariable("WASH_REG_PASSWORD", password)
+	script := fmt.Sprintf(
+		"%s -u \"$WASH_REG_USER\" -p \"$WASH_REG_PASSWORD\" %q %q",
+		strings.Join(args, " "),
+		ref,
+		artifactPath,
+	)
+	return c.WithExec([]string{"sh", "-c", script})
+}
+
+func syncPublishContainers(ctx context.Context, containers []*dagger.Container) error {
+	const markerPath = "/tmp/wash-published"
+
+	published := dag.Directory()
+	for i, c := range containers {
+		c = c.WithExec([]string{"touch", markerPath})
+		published = published.WithFile(fmt.Sprintf("%d", i), c.File(markerPath))
+	}
+	_, err := published.Sync(ctx)
+	return err
 }
