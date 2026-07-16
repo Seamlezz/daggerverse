@@ -327,9 +327,23 @@ func (m *Wash) WitFetch(
 			)
 		}
 		fetched := fetchContainer.
+			WithExec([]string{"sh", "-c", `set -eu
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu ;;
+  aarch64|arm64) target=aarch64-unknown-linux-gnu ;;
+  *) echo "unsupported wkg architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+curl -fsSL "https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-${target}" -o /usr/local/bin/wkg
+chmod +x /usr/local/bin/wkg
+wkg --version`}).
 			WithNewFile(componentLock, rootLock).
 			WithWorkdir(path.Join(workspaceDir, componentDir)).
-			WithExec([]string{"wash", "wit", "fetch", "--clean", "--non-interactive"})
+			WithExec([]string{"sh", "-c", `rm -rf wit/deps
+if [ -f /root/.config/wasm-pkg/config.toml ]; then
+  wkg wit fetch --config /root/.config/wasm-pkg/config.toml
+else
+  wkg wit fetch
+fi`})
 		lock, err := fetched.File(componentLock).Contents(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("fetch WIT for %s: %w", componentDir, err)
