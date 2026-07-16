@@ -294,6 +294,9 @@ func (m *Wash) WitFetch(
 	source *dagger.Directory,
 	// ComponentDirs are component directories relative to source.
 	componentDirs []string,
+	// OciConfig is an optional Docker config.json secret used to authenticate WIT registry requests.
+	// +optional
+	ociConfig *dagger.Secret,
 ) (*dagger.Directory, error) {
 	resolvedDirs, err := resolveDirs(componentDirs)
 	if err != nil {
@@ -314,6 +317,9 @@ func (m *Wash) WitFetch(
 	for _, componentDir := range resolvedDirs {
 		componentLock := path.Join(workspaceDir, componentDir, "wkg.lock")
 		fetchContainer := m.Container().WithDirectory(workspaceDir, source)
+		if ociConfig != nil {
+			fetchContainer = fetchContainer.WithMountedSecret("/root/.docker/config.json", ociConfig)
+		}
 		if len(configMatches) > 0 {
 			fetchContainer = fetchContainer.WithFile(
 				"/root/.config/wasm-pkg/config.toml",
@@ -347,8 +353,11 @@ func (m *Wash) WitFetchChanges(
 	source *dagger.Directory,
 	// ComponentDirs are component directories relative to source.
 	componentDirs []string,
+	// OciConfig is an optional Docker config.json secret used to authenticate WIT registry requests.
+	// +optional
+	ociConfig *dagger.Secret,
 ) (*dagger.Changeset, error) {
-	fetched, err := m.WitFetch(ctx, source, componentDirs)
+	fetched, err := m.WitFetch(ctx, source, componentDirs, ociConfig)
 	if err != nil {
 		return nil, err
 	}
