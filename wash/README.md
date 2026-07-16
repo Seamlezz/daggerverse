@@ -8,6 +8,7 @@ Reusable Dagger module for wasmCloud `wash` workflows.
 - `wash build` for one component.
 - Multi-component builds from explicit paths or auto-discovery.
 - OCI publishing with `wash oci push`.
+- Hermetic WIT dependency fetching with locked, clean output.
 - Optional registry credentials.
 - Always publishes `latest`, and optionally an additional version tag.
 
@@ -111,6 +112,21 @@ nats-echo.wasm
 smoke-counter.wasm
 ```
 
+## Fetch WIT dependencies
+
+`WitFetch` accepts a source directory and explicit component directories, sorts and deduplicates the paths, and runs `wash wit fetch --clean --non-interactive` in each component with the pinned toolchain container. It returns the updated source directory. `WitFetchChanges` returns the same result as a changeset.
+
+```bash
+cd /path/to/repo
+dagger -m /path/to/daggerverse/wash call \
+  wit-fetch --source=. \
+  --component-dirs=backend/access/auth-callout \
+  --component-dirs=backend/wasmcloud-utils \
+  export --path=/tmp/wit-source
+```
+
+The source directory must include the repository-root `wkg.lock` and each component's WIT sources. That root file is the sole dependency lock: each fetch temporarily exposes it at the component lock path through a symlink, then removes the symlink from the output. Repositories migrating to this API should remove component-local lock files from version control.
+
 ## Publish one component
 
 `Publish` runs `wash build` and then pushes `latest` plus the optional tag.
@@ -199,4 +215,4 @@ Other modules can call `Container()` to get a container with Rust, `wasm32-wasip
 c := dag.Wash(source).Container()
 ```
 
-Use `Build`, `BuildComponents`, `Publish`, and `PublishComponents` for the standard component workflows.
+Use `Build`, `BuildComponents`, `WitFetch`, `WitFetchChanges`, `Publish`, and `PublishComponents` for the standard component workflows.
