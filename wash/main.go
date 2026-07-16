@@ -304,12 +304,23 @@ func (m *Wash) WitFetch(
 		return nil, fmt.Errorf("read root wkg.lock: %w", err)
 	}
 
+	configMatches, err := source.Glob(ctx, ".wasm-pkg/config.toml")
+	if err != nil {
+		return nil, fmt.Errorf("locate workspace wasm-pkg config: %w", err)
+	}
+
 	result := source
 	componentLocks := make([]string, 0, len(resolvedDirs))
 	for _, componentDir := range resolvedDirs {
 		componentLock := path.Join(workspaceDir, componentDir, "wkg.lock")
-		fetched := m.Container().
-			WithDirectory(workspaceDir, source).
+		fetchContainer := m.Container().WithDirectory(workspaceDir, source)
+		if len(configMatches) > 0 {
+			fetchContainer = fetchContainer.WithFile(
+				"/root/.config/wasm-pkg/config.toml",
+				source.File(".wasm-pkg/config.toml"),
+			)
+		}
+		fetched := fetchContainer.
 			WithNewFile(componentLock, rootLock).
 			WithWorkdir(path.Join(workspaceDir, componentDir)).
 			WithExec([]string{"wash", "wit", "fetch", "--clean", "--non-interactive"})
