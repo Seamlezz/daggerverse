@@ -1,12 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"dagger/wash/internal/dagger"
 
@@ -15,734 +18,629 @@ import (
 )
 
 const (
-	workspaceDir = "/workspace"
-	artifactDir  = "/wash-artifacts"
+	workspaceDir      = "/workspace"
+	outputDir         = "/out"
+	washVersion       = "v2.5.2"
+	cacheSchema       = "wash-v2"
+	fallbackRustImage = "rust:1.95-bookworm"
 
-	cargoRegistryCache = "wash-cargo-registry"
-	cargoGitCache      = "wash-cargo-git"
+	washArm64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.5.2/wash-aarch64-unknown-linux-gnu"
+	washArm64Checksum = "sha256:2c29cc651b87062d60c145942abce022c431710e398c47213f04d59062db4683"
+	washAMD64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.5.2/wash-x86_64-unknown-linux-gnu"
+	washAMD64Checksum = "sha256:fef1e14a645144c84b4518ff5c907510b28dcd050576b80bd2c1d9d0dba6f02a"
 )
 
-// Wash is a reusable Dagger module for wasmCloud wash workflows.
-// It provides a wash/Rust toolchain plus helpers to build and publish wasmCloud components.
+// Wash builds and publishes wasmCloud components.
 type Wash struct {
-	// Source is the repository or workspace root containing component directories.
-	Source *dagger.Directory
+	Source         *dagger.Directory
+	RootDir        string
+	CacheNamespace string
+	RustImage      string
+}
 
-	// WashVersion is the wash CLI version installed in the toolchain.
-	WashVersion string
-
-	// RustImage is the Rust toolchain base image.
-	RustImage string
+// New creates a workspace-first wasmCloud component publisher.
+func New(
+	source *dagger.Workspace,
+	// CacheNamespace is a stable caller-owned cache identity.
+	cacheNamespace string,
+	// +optional
+	// +default="/"
+	rootDir string,
+	// +optional
+	rustImage string,
+) *Wash {
+	return &Wash{
+		Source:         source.Directory(rootDir, dagger.WorkspaceDirectoryOpts{Exclude: []string{".git", "target", "node_modules", ".dart_tool", "build", "dist"}, Gitignore: true}),
+		RootDir:        rootDir,
+		CacheNamespace: strings.TrimSpace(cacheNamespace),
+		RustImage:      strings.TrimSpace(rustImage),
+	}
 }
 
 type washConfig struct {
 	Build struct {
-		ComponentPath string `yaml:"component_path"`
+		Command       string            `yaml:"command"`
+		Env           map[string]string `yaml:"env"`
+		ComponentPath string            `yaml:"component_path"`
 	} `yaml:"build"`
 	Wit struct {
 		SkipFetch bool `yaml:"skip_fetch"`
 	} `yaml:"wit"`
 }
 
-// New creates a wasmCloud wash toolchain module.
-func New(
-	// Source is the repository or workspace root containing component directories.
-	source *dagger.Workspace,
+type rustVersion struct {
+	Value     string
+	Workspace bool
+}
 
-	// RootDir selects the source subdirectory mounted as /workspace.
-	// +optional
-	// +default="/"
-	rootDir string,
-
-	// WashVersion pins the wash CLI version installed in the toolchain.
-	// +optional
-	// +default="2.5.2"
-	washVersion string,
-
-	// RustImage is the base Rust toolchain image.
-	// +optional
-	// +default="rust:latest"
-	rustImage string,
-) *Wash {
-	return &Wash{
-		Source: source.Directory(rootDir, dagger.WorkspaceDirectoryOpts{
-			Exclude:   []string{".git", "target", "node_modules", ".dart_tool", "build", "dist"},
-			Gitignore: true,
-		}),
-		WashVersion: washVersion,
-		RustImage:   rustImage,
+func (v *rustVersion) UnmarshalTOML(value any) error {
+	switch value := value.(type) {
+	case string:
+		v.Value = value
+		return nil
+	case map[string]any:
+		workspace, ok := value["workspace"].(bool)
+		if !ok || !workspace {
+			return fmt.Errorf("rust-version table must set workspace = true")
+		}
+		v.Workspace = true
+		return nil
+	default:
+		return fmt.Errorf("rust-version must be a string or workspace table")
 	}
 }
 
-// Container returns a reusable wash/Rust toolchain container.
-func (m *Wash) Container() *dagger.Container {
-	return dag.Container().
-		From(m.RustImage).
-		WithMountedCache("/usr/local/cargo/registry", dag.CacheVolume(cargoRegistryCache)).
-		WithMountedCache("/usr/local/cargo/git", dag.CacheVolume(cargoGitCache)).
-		WithExec([]string{"sh", "-c", "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*"}).
-		WithExec([]string{"rustup", "target", "add", "wasm32-wasip2"}).
-		WithEnvVariable("WASH_VERSION", normalizedWashVersion(m.WashVersion)).
-		WithExec([]string{"sh", "-c", "curl -fsSL https://wasmcloud.com/sh | INSTALL_DIR=/usr/local/bin WASH_VERSION=\"$WASH_VERSION\" bash -s -- --no-modify-path"}).
-		WithExec([]string{"wash", "--version"})
+type cargoManifest struct {
+	Package struct {
+		Name        string      `toml:"name"`
+		RustVersion rustVersion `toml:"rust-version"`
+	} `toml:"package"`
+	Workspace struct {
+		Members []string `toml:"members"`
+		Package struct {
+			RustVersion string `toml:"rust-version"`
+		} `toml:"package"`
+	} `toml:"workspace"`
 }
 
-func (m *Wash) componentContainer(ctx context.Context, componentDir string) (*dagger.Container, error) {
-	componentDir = cleanComponentDir(componentDir)
+type componentPlan struct {
+	Dir, ID, ArtifactPath, WorkspaceRoot, PackageName, RustVersion string
+	Config                                                         washConfig
+	FastPath                                                       bool
+}
 
-	cfg, err := m.loadConfig(ctx, componentDir)
+type buildGroup struct {
+	WorkspaceRoot, RustVersion, RustImage string
+	Components                            []componentPlan
+}
+
+func resolveDirs(dirs []string) ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || dir == "/" {
+			dir = "."
+		}
+		if strings.HasPrefix(dir, "/") {
+			dir = strings.TrimPrefix(path.Clean(dir), "/")
+		} else {
+			dir = path.Clean(dir)
+		}
+		if dir == ".." || strings.HasPrefix(dir, "../") {
+			return nil, fmt.Errorf("component directory %q must be within the source root", dir)
+		}
+		if !seen[dir] {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (m *Wash) componentDirs(ctx context.Context, dirs []string) ([]string, error) {
+	if len(dirs) > 0 {
+		return resolveDirs(dirs)
+	}
+	matches, err := m.Source.Glob(ctx, "**/.wash/config.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("discover components: %w", err)
+	}
+	root, err := m.Source.Glob(ctx, ".wash/config.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("discover root component: %w", err)
+	}
+	matches = append(matches, root...)
+	for i := range matches {
+		matches[i] = path.Dir(path.Dir(matches[i]))
+	}
+	dirs, err = resolveDirs(matches)
 	if err != nil {
 		return nil, err
 	}
-
-	targetDir := targetCacheMountPath(componentDir, cfg.Build.ComponentPath)
-
-	return m.Container().
-		WithDirectory(workspaceDir, m.Source).
-		WithMountedCache(targetDir, dag.CacheVolume(targetCacheKey(componentDir))).
-		WithWorkdir(path.Join(workspaceDir, componentDir)), nil
+	if len(dirs) == 0 {
+		return nil, fmt.Errorf("no wasmCloud components found")
+	}
+	return dirs, nil
 }
 
-func (m *Wash) loadConfig(ctx context.Context, componentDir string) (washConfig, error) {
-	componentDir = cleanComponentDir(componentDir)
-	configPath := path.Join(componentDir, ".wash", "config.yaml")
-	contents, err := m.Source.File(configPath).Contents(ctx)
+func (m *Wash) readManifest(ctx context.Context, manifestPath string) (cargoManifest, error) {
+	contents, err := m.Source.File(manifestPath).Contents(ctx)
 	if err != nil {
-		return washConfig{}, fmt.Errorf("read %s: %w", configPath, err)
+		return cargoManifest{}, err
 	}
-
-	var cfg washConfig
-	if err := yaml.Unmarshal([]byte(contents), &cfg); err != nil {
-		return washConfig{}, fmt.Errorf("parse %s: %w", configPath, err)
+	var manifest cargoManifest
+	if _, err := toml.Decode(contents, &manifest); err != nil {
+		return manifest, fmt.Errorf("parse %s: %w", manifestPath, err)
 	}
-
-	return cfg, nil
+	return manifest, nil
 }
 
-func resolveArtifactPath(componentDir string, componentPath string) string {
-	componentDir = cleanComponentDir(componentDir)
-	return path.Clean(path.Join(workspaceDir, componentDir, componentPath))
+func (m *Wash) workspaceFor(ctx context.Context, componentDir string) (string, cargoManifest, cargoManifest, error) {
+	packageManifest, err := m.readManifest(ctx, path.Join(componentDir, "Cargo.toml"))
+	if err != nil {
+		return "", cargoManifest{}, cargoManifest{}, err
+	}
+	for dir := componentDir; ; dir = path.Dir(dir) {
+		manifestPath := path.Join(dir, "Cargo.toml")
+		exists, existsErr := m.Source.Exists(ctx, manifestPath)
+		if existsErr != nil {
+			return "", cargoManifest{}, packageManifest, fmt.Errorf("check %s: %w", manifestPath, existsErr)
+		}
+		if exists {
+			manifest, readErr := m.readManifest(ctx, manifestPath)
+			if readErr != nil {
+				return "", cargoManifest{}, packageManifest, readErr
+			}
+			if len(manifest.Workspace.Members) > 0 || dir == "." {
+				return dir, manifest, packageManifest, nil
+			}
+		}
+		if dir == "." {
+			break
+		}
+	}
+	return "", cargoManifest{}, packageManifest, fmt.Errorf("no Cargo workspace contains %s", componentDir)
 }
 
-func targetCacheMountPath(componentDir string, componentPath string) string {
-	componentDir = cleanComponentDir(componentDir)
-	artifactPath := resolveArtifactPath(componentDir, componentPath)
+func workspaceMember(workspaceRoot, componentDir string, members []string) bool {
+	relative := strings.TrimPrefix(componentDir, workspaceRoot+"/")
+	if workspaceRoot == "." {
+		relative = strings.TrimPrefix(componentDir, "./")
+	}
+	if relative == "." {
+		return true
+	}
+	for _, member := range members {
+		matched, matchErr := path.Match(path.Clean(member), relative)
+		if matchErr == nil && matched {
+			return true
+		}
+	}
+	return false
+}
 
-	for dir := path.Dir(artifactPath); dir != "." && dir != "/"; dir = path.Dir(dir) {
+func relativeContained(base, value string) (string, error) {
+	resolved := path.Clean(path.Join(base, value))
+	if resolved == ".." || strings.HasPrefix(resolved, "../") || path.IsAbs(value) {
+		return "", fmt.Errorf("path %q escapes source root", value)
+	}
+	return resolved, nil
+}
+
+func (m *Wash) resolveComponents(ctx context.Context, dirs []string) ([]componentPlan, error) {
+	if m.CacheNamespace == "" {
+		return nil, fmt.Errorf("cacheNamespace is required")
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`).MatchString(m.CacheNamespace) {
+		return nil, fmt.Errorf("invalid cacheNamespace %q", m.CacheNamespace)
+	}
+	resolved, err := m.componentDirs(ctx, dirs)
+	if err != nil {
+		return nil, err
+	}
+	plans := make([]componentPlan, 0, len(resolved))
+	ids, artifacts := map[string]string{}, map[string]string{}
+	for _, dir := range resolved {
+		configPath := path.Join(dir, ".wash/config.yaml")
+		contents, err := m.Source.File(configPath).Contents(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", configPath, err)
+		}
+		var cfg washConfig
+		if err := yaml.Unmarshal([]byte(contents), &cfg); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", configPath, err)
+		}
+		if strings.TrimSpace(cfg.Build.ComponentPath) == "" {
+			return nil, fmt.Errorf("%s is missing build.component_path", configPath)
+		}
+		artifact, err := relativeContained(dir, cfg.Build.ComponentPath)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", configPath, err)
+		}
+		fallbackID := path.Base(dir)
+		if dir == "." {
+			fallbackID = strings.TrimSuffix(path.Base(artifact), path.Ext(artifact))
+		}
+		plan := componentPlan{Dir: dir, ID: fallbackID, ArtifactPath: artifact, Config: cfg}
+		workspace, workspaceManifest, packageManifest, cargoErr := m.workspaceFor(ctx, dir)
+		if cargoErr == nil && packageManifest.Package.Name != "" && workspaceMember(workspace, dir, workspaceManifest.Workspace.Members) {
+			plan.WorkspaceRoot, plan.PackageName = workspace, packageManifest.Package.Name
+			plan.RustVersion = packageManifest.Package.RustVersion.Value
+			if packageManifest.Package.RustVersion.Workspace || plan.RustVersion == "" {
+				plan.RustVersion = workspaceManifest.Workspace.Package.RustVersion
+			}
+			command := strings.Join(strings.Fields(cfg.Build.Command), " ")
+			expectedArtifact := path.Join(workspace, "target/wasm32-wasip2/release", strings.ReplaceAll(plan.PackageName, "-", "_")+".wasm")
+			plan.FastPath = cfg.Wit.SkipFetch && len(cfg.Build.Env) == 0 && command == "cargo build --target wasm32-wasip2 --release" && plan.RustVersion != "" && artifact == expectedArtifact
+			if plan.FastPath {
+				plan.ID = plan.PackageName
+			}
+		}
+		if !namePattern.MatchString(plan.ID) || strings.Contains(plan.ID, "/") {
+			return nil, fmt.Errorf("component %q has invalid OCI path segment ID %q", dir, plan.ID)
+		}
+		if old := ids[plan.ID]; old != "" {
+			return nil, fmt.Errorf("components %q and %q have duplicate ID %q", old, dir, plan.ID)
+		}
+		if old := artifacts[path.Base(artifact)]; old != "" {
+			return nil, fmt.Errorf("components %q and %q have duplicate artifact %q", old, dir, path.Base(artifact))
+		}
+		ids[plan.ID], artifacts[path.Base(artifact)] = dir, dir
+		plans = append(plans, plan)
+	}
+	return plans, nil
+}
+
+func groupBuilds(plans []componentPlan, override string) []buildGroup {
+	groups := map[string]*buildGroup{}
+	for _, plan := range plans {
+		if !plan.FastPath {
+			continue
+		}
+		image := override
+		if image == "" {
+			image = "rust:" + plan.RustVersion + "-bookworm"
+		}
+		key := plan.WorkspaceRoot + "\x00" + plan.RustVersion + "\x00" + image
+		if groups[key] == nil {
+			groups[key] = &buildGroup{WorkspaceRoot: plan.WorkspaceRoot, RustVersion: plan.RustVersion, RustImage: image}
+		}
+		groups[key].Components = append(groups[key].Components, plan)
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]buildGroup, 0, len(keys))
+	for _, key := range keys {
+		sort.Slice(groups[key].Components, func(i, j int) bool { return groups[key].Components[i].ID < groups[key].Components[j].ID })
+		out = append(out, *groups[key])
+	}
+	return out
+}
+
+func cachePart(value string) string {
+	return regexp.MustCompile(`[^A-Za-z0-9._-]+`).ReplaceAllString(value, "-")
+}
+
+func washRelease(platform string) (string, string, error) {
+	parts := strings.Split(platform, "/")
+	if len(parts) < 2 || parts[0] != "linux" {
+		return "", "", fmt.Errorf("unsupported wash platform %q", platform)
+	}
+	switch parts[1] {
+	case "arm64":
+		return washArm64URL, washArm64Checksum, nil
+	case "amd64":
+		return washAMD64URL, washAMD64Checksum, nil
+	default:
+		return "", "", fmt.Errorf("unsupported wash platform %q", platform)
+	}
+}
+
+func withWash(ctx context.Context, container *dagger.Container) (*dagger.Container, error) {
+	platform, err := dag.DefaultPlatform(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve default platform: %w", err)
+	}
+	url, checksum, err := washRelease(string(platform))
+	if err != nil {
+		return nil, err
+	}
+	binary := dag.HTTP(url, dagger.HTTPOpts{Checksum: checksum, Permissions: 0o755})
+	return container.WithFile("/usr/local/bin/wash", binary), nil
+}
+
+func rustBase(image string) *dagger.Container {
+	return dag.Container().From(image).
+		WithExec([]string{"sh", "-c", "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*"}).
+		WithExec([]string{"rustup", "target", "add", "wasm32-wasip2"})
+}
+
+func withCargoCaches(container *dagger.Container, rustVersion string) *dagger.Container {
+	// Keep mutable Cargo caches after reproducible toolchain layers. Mounting
+	// them earlier would force tool installation to execute on every call.
+	return container.
+		WithMountedCache("/usr/local/cargo/registry", dag.CacheVolume(cacheSchema+"/cargo-registry/"+cachePart(rustVersion)), dagger.ContainerWithMountedCacheOpts{Sharing: dagger.CacheSharingModeShared}).
+		WithMountedCache("/usr/local/cargo/git", dag.CacheVolume(cacheSchema+"/cargo-git/"+cachePart(rustVersion)), dagger.ContainerWithMountedCacheOpts{Sharing: dagger.CacheSharingModeShared})
+}
+
+func cargoToolchain(image, rustVersion string) *dagger.Container {
+	return withCargoCaches(rustBase(image), rustVersion)
+}
+
+func washToolchain(ctx context.Context, image, rustVersion string) (*dagger.Container, error) {
+	container, err := withWash(ctx, rustBase(image))
+	if err != nil {
+		return nil, err
+	}
+	return withCargoCaches(container, rustVersion), nil
+}
+
+func publisherContainer(ctx context.Context) (*dagger.Container, error) {
+	base := dag.Container().From("debian:bookworm-slim").WithExec([]string{"sh", "-c", "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"})
+	return withWash(ctx, base)
+}
+
+func cargoBuildArgs(group buildGroup) []string {
+	args := []string{"cargo", "build", "--locked", "--target", "wasm32-wasip2", "--release"}
+	for _, component := range group.Components {
+		args = append(args, "--package", component.PackageName)
+	}
+	return args
+}
+
+func fallbackTargetDir(component componentPlan) string {
+	for dir := path.Dir(component.ArtifactPath); dir != "." && dir != "/"; dir = path.Dir(dir) {
 		if path.Base(dir) == "target" {
 			return dir
 		}
 	}
-
-	return path.Join(workspaceDir, componentDir, "target")
+	return path.Join(component.Dir, "target")
 }
 
-func (m *Wash) artifactPath(ctx context.Context, componentDir string) (string, error) {
-	componentDir = cleanComponentDir(componentDir)
-	configPath := path.Join(componentDir, ".wash", "config.yaml")
-	cfg, err := m.loadConfig(ctx, componentDir)
-	if err != nil {
-		return "", err
+func fallbackTargetCacheKey(namespace string, component componentPlan) string {
+	scope := component.WorkspaceRoot
+	if scope == "" {
+		scope = component.Dir
 	}
-	if strings.TrimSpace(cfg.Build.ComponentPath) == "" {
-		return "", fmt.Errorf("%s is missing build.component_path", configPath)
-	}
-
-	return resolveArtifactPath(componentDir, cfg.Build.ComponentPath), nil
+	return strings.Join([]string{cacheSchema, "target", cachePart(namespace), cachePart(scope), cachePart(component.RustVersion), "wasm32-wasip2", "release"}, "/")
 }
 
-func (m *Wash) buildArgs(ctx context.Context, componentDir string) ([]string, error) {
-	cfg, err := m.loadConfig(ctx, componentDir)
-	if err != nil {
-		return nil, err
-	}
-
-	args := []string{"wash", "build"}
-	if cfg.Wit.SkipFetch {
-		args = append(args, "--skip-fetch")
-	}
-	return args, nil
-}
-
-func (m *Wash) buildContainer(ctx context.Context, componentDir string) (*dagger.Container, string, error) {
-	componentDir = cleanComponentDir(componentDir)
-
-	artifactPath, err := m.artifactPath(ctx, componentDir)
-	if err != nil {
-		return nil, "", err
-	}
-
-	buildArgs, err := m.buildArgs(ctx, componentDir)
-	if err != nil {
-		return nil, "", err
-	}
-
-	outputPath := path.Join(artifactDir, path.Base(artifactPath))
-	copyArtifact := fmt.Sprintf("mkdir -p %q && cp %q %q", path.Dir(outputPath), artifactPath, outputPath)
-
-	c, err := m.componentContainer(ctx, componentDir)
-	if err != nil {
-		return nil, "", err
-	}
-
-	c = c.
-		WithExec(buildArgs).
-		WithExec([]string{"sh", "-c", copyArtifact})
-
-	return c, outputPath, nil
-}
-
-func resolveDirs(componentDirs []string) ([]string, error) {
-	if len(componentDirs) == 0 {
-		return nil, fmt.Errorf("at least one component directory is required")
-	}
-
-	resolved := make([]string, 0, len(componentDirs))
-	seen := make(map[string]struct{}, len(componentDirs))
-	for _, componentDir := range componentDirs {
-		componentDir = cleanComponentDir(componentDir)
-		if componentDir == "." || componentDir == ".." || strings.HasPrefix(componentDir, "../") {
-			return nil, fmt.Errorf("component directory %q must be below the source root", componentDir)
+func (m *Wash) buildArtifacts(ctx context.Context, plans []componentPlan) (map[string]*dagger.File, error) {
+	artifacts := map[string]*dagger.File{}
+	for _, group := range groupBuilds(plans, m.RustImage) {
+		targetCache := fmt.Sprintf("%s/target/%s/%s/%s/wasm32-wasip2/release", cacheSchema, cachePart(m.CacheNamespace), cachePart(group.WorkspaceRoot), cachePart(group.RustVersion))
+		container := cargoToolchain(group.RustImage, group.RustVersion).
+			WithDirectory(workspaceDir, m.Source).
+			WithMountedCache(path.Join(workspaceDir, group.WorkspaceRoot, "target"), dag.CacheVolume(targetCache), dagger.ContainerWithMountedCacheOpts{Sharing: dagger.CacheSharingModeLocked}).
+			WithWorkdir(path.Join(workspaceDir, group.WorkspaceRoot)).WithExec(cargoBuildArgs(group))
+		for _, component := range group.Components {
+			out := path.Join(outputDir, component.ID+".wasm")
+			container = container.WithExec([]string{"sh", "-c", fmt.Sprintf("mkdir -p %q && cp %q %q", outputDir, path.Join(workspaceDir, component.ArtifactPath), out)})
+			artifacts[component.ID] = container.File(out)
 		}
-		if _, exists := seen[componentDir]; exists {
+	}
+	for _, component := range plans {
+		if component.FastPath {
 			continue
 		}
-		seen[componentDir] = struct{}{}
-		resolved = append(resolved, componentDir)
-	}
-	sort.Strings(resolved)
-	return resolved, nil
-}
-
-type wkgLock struct {
-	Version  int          `toml:"version"`
-	Packages []wkgPackage `toml:"packages"`
-}
-
-type wkgPackage struct {
-	Name     string       `toml:"name"`
-	Registry string       `toml:"registry"`
-	Versions []wkgVersion `toml:"versions"`
-}
-
-type wkgVersion struct {
-	Requirement string `toml:"requirement"`
-	Version     string `toml:"version"`
-	Digest      string `toml:"digest"`
-}
-
-func mergeWkgLocks(contents []string) (string, error) {
-	packages := map[string]wkgPackage{}
-	versions := map[string]wkgVersion{}
-	for _, content := range contents {
-		var lock wkgLock
-		if _, err := toml.Decode(content, &lock); err != nil {
-			return "", fmt.Errorf("parse wkg.lock: %w", err)
-		}
-		if lock.Version != 1 {
-			return "", fmt.Errorf("unsupported wkg.lock version %d", lock.Version)
-		}
-		for _, pkg := range lock.Packages {
-			packageKey := pkg.Name + "\x00" + pkg.Registry
-			stored := packages[packageKey]
-			stored.Name, stored.Registry = pkg.Name, pkg.Registry
-			for _, version := range pkg.Versions {
-				versionKey := packageKey + "\x00" + version.Requirement + "\x00" + version.Version
-				if existing, found := versions[versionKey]; found && existing != version {
-					return "", fmt.Errorf("conflicting lock entries for %s %s %s", pkg.Name, version.Requirement, version.Version)
-				}
-				versions[versionKey] = version
-			}
-			packages[packageKey] = stored
-		}
-	}
-
-	packageKeys := make([]string, 0, len(packages))
-	for key := range packages {
-		packageKeys = append(packageKeys, key)
-	}
-	sort.Strings(packageKeys)
-	merged := wkgLock{Version: 1}
-	for _, packageKey := range packageKeys {
-		pkg := packages[packageKey]
-		prefix := packageKey + "\x00"
-		versionKeys := make([]string, 0)
-		for key := range versions {
-			if strings.HasPrefix(key, prefix) {
-				versionKeys = append(versionKeys, key)
-			}
-		}
-		sort.Strings(versionKeys)
-		for _, key := range versionKeys {
-			pkg.Versions = append(pkg.Versions, versions[key])
-		}
-		merged.Packages = append(merged.Packages, pkg)
-	}
-
-	var output bytes.Buffer
-	output.WriteString("# This file is automatically generated.\n# It is not intended for manual editing.\n")
-	if err := toml.NewEncoder(&output).Encode(merged); err != nil {
-		return "", fmt.Errorf("encode wkg.lock: %w", err)
-	}
-	return output.String(), nil
-}
-
-// WitFetch fetches and locks WIT dependencies for the requested components.
-func (m *Wash) WitFetch(
-	ctx context.Context,
-	// Source is the repository root containing the components and shared wkg.lock.
-	source *dagger.Directory,
-	// ComponentDirs are component directories relative to source.
-	componentDirs []string,
-	// OciConfig is an optional Docker config.json secret used to authenticate WIT registry requests.
-	// +optional
-	ociConfig *dagger.Secret,
-) (*dagger.Directory, error) {
-	resolvedDirs, err := resolveDirs(componentDirs)
-	if err != nil {
-		return nil, err
-	}
-	rootLock, err := source.File("wkg.lock").Contents(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("read root wkg.lock: %w", err)
-	}
-
-	configMatches, err := source.Glob(ctx, ".wasm-pkg/config.toml")
-	if err != nil {
-		return nil, fmt.Errorf("locate workspace wasm-pkg config: %w", err)
-	}
-
-	result := source
-	componentLocks := make([]string, 0, len(resolvedDirs))
-	for _, componentDir := range resolvedDirs {
-		componentLock := path.Join(workspaceDir, componentDir, "wkg.lock")
-		fetchContainer := m.Container().WithDirectory(workspaceDir, source)
-		if ociConfig != nil {
-			fetchContainer = fetchContainer.WithMountedSecret("/root/.docker/config.json", ociConfig)
-		}
-		if len(configMatches) > 0 {
-			fetchContainer = fetchContainer.WithFile(
-				"/root/.config/wasm-pkg/config.toml",
-				source.File(".wasm-pkg/config.toml"),
-			)
-		}
-		fetched := fetchContainer.
-			WithExec([]string{"sh", "-c", `set -eu
-case "$(uname -m)" in
-  x86_64) target=x86_64-unknown-linux-gnu ;;
-  aarch64|arm64) target=aarch64-unknown-linux-gnu ;;
-  *) echo "unsupported wkg architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-curl -fsSL "https://github.com/bytecodealliance/wasm-pkg-tools/releases/download/v0.15.1/wkg-${target}" -o /usr/local/bin/wkg
-chmod +x /usr/local/bin/wkg
-wkg --version`}).
-			WithNewFile(componentLock, rootLock).
-			WithWorkdir(path.Join(workspaceDir, componentDir)).
-			WithExec([]string{"sh", "-c", `rm -rf wit/deps
-if [ -f /root/.config/wasm-pkg/config.toml ]; then
-  wkg wit fetch --config /root/.config/wasm-pkg/config.toml
-else
-  wkg wit fetch
-fi`})
-		lock, err := fetched.File(componentLock).Contents(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("fetch WIT for %s: %w", componentDir, err)
-		}
-		componentLocks = append(componentLocks, lock)
-		depsPath := path.Join(componentDir, "wit", "deps")
-		result = result.WithoutDirectory(depsPath).WithDirectory(depsPath, fetched.Directory(path.Join(workspaceDir, depsPath)))
-		result = result.WithoutFile(path.Join(componentDir, "wkg.lock"))
-	}
-	mergedLock, err := mergeWkgLocks(componentLocks)
-	if err != nil {
-		return nil, err
-	}
-	return result.WithNewFile("wkg.lock", mergedLock), nil
-}
-
-// WitFetchChanges fetches WIT dependencies and returns the resulting source changes.
-func (m *Wash) WitFetchChanges(
-	ctx context.Context,
-	// Source is the repository root containing the components and shared wkg.lock.
-	source *dagger.Directory,
-	// ComponentDirs are component directories relative to source.
-	componentDirs []string,
-	// OciConfig is an optional Docker config.json secret used to authenticate WIT registry requests.
-	// +optional
-	ociConfig *dagger.Secret,
-) (*dagger.Changeset, error) {
-	fetched, err := m.WitFetch(ctx, source, componentDirs, ociConfig)
-	if err != nil {
-		return nil, err
-	}
-	return fetched.Changes(source), nil
-}
-
-func (m *Wash) resolveComponentDirs(ctx context.Context, componentDirs []string) ([]string, error) {
-	if len(componentDirs) > 0 {
-		resolved := make([]string, 0, len(componentDirs))
-		for _, componentDir := range componentDirs {
-			resolved = append(resolved, cleanComponentDir(componentDir))
-		}
-		return resolved, nil
-	}
-
-	matches, err := m.Source.Glob(ctx, "**/.wash/config.yaml")
-	if err != nil {
-		return nil, err
-	}
-	rootMatches, err := m.Source.Glob(ctx, ".wash/config.yaml")
-	if err != nil {
-		return nil, err
-	}
-	matches = append(matches, rootMatches...)
-
-	dirsByName := map[string]struct{}{}
-	for _, match := range matches {
-		dir := cleanComponentDir(path.Dir(path.Dir(match)))
-		dirsByName[dir] = struct{}{}
-	}
-	if len(dirsByName) == 0 {
-		return nil, fmt.Errorf("no wasmCloud components found; expected at least one **/.wash/config.yaml")
-	}
-
-	dirs := make([]string, 0, len(dirsByName))
-	for dir := range dirsByName {
-		dirs = append(dirs, dir)
-	}
-	sort.Strings(dirs)
-	return dirs, nil
-}
-
-// Build runs wash build for a component and returns the built wasm artifact.
-func (m *Wash) Build(
-	ctx context.Context,
-	// ComponentDir is the component directory relative to the module source root.
-	// +optional
-	// +default="."
-	componentDir string,
-) (*dagger.File, error) {
-	c, outputPath, err := m.buildContainer(ctx, componentDir)
-	if err != nil {
-		return nil, err
-	}
-
-	return c.File(outputPath), nil
-}
-
-// BuildComponents builds multiple component directories and returns all wasm artifacts.
-// If componentDirs is empty, components are discovered by **/.wash/config.yaml.
-func (m *Wash) BuildComponents(
-	ctx context.Context,
-	// ComponentDirs are component directories relative to the module source root.
-	// If empty, components are auto-discovered from **/.wash/config.yaml.
-	// +optional
-	componentDirs []string,
-) (*dagger.Directory, error) {
-	resolvedDirs, err := m.resolveComponentDirs(ctx, componentDirs)
-	if err != nil {
-		return nil, err
-	}
-
-	out := dag.Directory()
-	for _, componentDir := range resolvedDirs {
-		artifact, err := m.Build(ctx, componentDir)
+		image := m.rustImageFor(component)
+		container, err := washToolchain(ctx, image, component.RustVersion)
 		if err != nil {
 			return nil, err
 		}
-		out = out.WithFile(path.Base(componentDir)+".wasm", artifact)
+		targetDir := fallbackTargetDir(component)
+		container = container.WithDirectory(workspaceDir, m.Source).
+			WithMountedCache(path.Join(workspaceDir, targetDir), dag.CacheVolume(fallbackTargetCacheKey(m.CacheNamespace, component)), dagger.ContainerWithMountedCacheOpts{Sharing: dagger.CacheSharingModeLocked}).
+			WithWorkdir(path.Join(workspaceDir, component.Dir))
+		args := []string{"wash", "build"}
+		if component.Config.Wit.SkipFetch {
+			args = append(args, "--skip-fetch")
+		}
+		out := path.Join(outputDir, component.ID+".wasm")
+		container = container.WithExec(args).WithExec([]string{"sh", "-c", fmt.Sprintf("mkdir -p %q && cp %q %q", outputDir, path.Join(workspaceDir, component.ArtifactPath), out)})
+		artifacts[component.ID] = container.File(out)
 	}
+	return artifacts, nil
+}
 
+// BuildComponents builds selected components, or discovers all components when omitted.
+func (m *Wash) BuildComponents(ctx context.Context,
+	// +optional
+	// ComponentDirs limits the build; omitting it discovers all components.
+	componentDirs []string,
+) (*dagger.Directory, error) {
+	plans, err := m.resolveComponents(ctx, componentDirs)
+	if err != nil {
+		return nil, err
+	}
+	artifacts, err := m.buildArtifacts(ctx, plans)
+	if err != nil {
+		return nil, err
+	}
+	out := dag.Directory()
+	for _, plan := range plans {
+		out = out.WithFile(plan.ID+".wasm", artifacts[plan.ID])
+	}
 	return out, nil
 }
 
-// Publish builds and pushes one wasmCloud component OCI artifact.
-func (m *Wash) Publish(
-	ctx context.Context,
-	// ComponentDir is the component directory relative to the module source root.
-	// +optional
-	// +default="."
-	componentDir string,
-
-	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
-	// +optional
-	registry *dagger.Service,
-
-	// Registry hostname that the client should use
-	// +optional
-	registryHostname string,
-
-	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
-	// +optional
-	repository string,
-
-	// ComponentName is the image name. Defaults to the component directory basename.
-	// +optional
-	componentName string,
-
-	// Tag is an optional additional tag. latest is always pushed.
-	// +optional
-	tag string,
-
-	// Username is optional OCI basic auth username.
-	// +optional
-	username string,
-
-	// Password is optional OCI basic auth password/token.
-	// +optional
-	password *dagger.Secret,
-
-	// Insecure allows pushing to an HTTP/insecure registry.
-	// +optional
-	// +default=false
-	insecure bool,
-) (string, error) {
-	componentDir = cleanComponentDir(componentDir)
-	if strings.TrimSpace(componentName) == "" {
-		componentName = path.Base(componentDir)
+func (m *Wash) rustImageFor(plan componentPlan) string {
+	if m.RustImage != "" {
+		return m.RustImage
 	}
-
-	if registryHostname == "" {
-		var err error
-		registryHostname, err = registry.Endpoint(ctx)
-		if err != nil {
-			return "", err
-		}
+	if plan.RustVersion != "" {
+		return "rust:" + plan.RustVersion + "-bookworm"
 	}
-
-	base, err := imageBase(ctx, registryHostname, repository, componentName)
-	if err != nil {
-		return "", err
-	}
-	if err := validateCredentials(username, password); err != nil {
-		return "", err
-	}
-
-	containers, refs, err := m.publishContainers(ctx, componentDir, registry, registryHostname, base, tag, username, password, insecure)
-	if err != nil {
-		return "", err
-	}
-	if err := syncPublishContainers(ctx, containers); err != nil {
-		return "", err
-	}
-
-	return strings.Join(refs, "\n"), nil
+	return fallbackRustImage
 }
 
-// PublishComponents builds and pushes multiple components using directory basenames as image names.
-// If componentDirs is empty, components are discovered by **/.wash/config.yaml.
-func (m *Wash) PublishComponents(
-	ctx context.Context,
-	// ComponentDirs are component directories relative to the module source root.
-	// If empty, components are auto-discovered from **/.wash/config.yaml.
-	// +optional
-	componentDirs []string,
+var registryPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*)(?::[0-9]+)?$`)
+var namePattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
 
-	// Registry is the OCI registry host, e.g. ghcr.io or localhost:5000.
-	// +optional
-	registry *dagger.Service,
-
-	// Registry hostname that the client should use
-	// +optional
-	registryHostname string,
-
-	// Repository is an optional path below the registry, e.g. seamlezz/wasmcloud-smoke.
-	// +optional
-	repository string,
-
-	// Tag is an optional additional tag. latest is always pushed.
-	// +optional
-	tag string,
-
-	// Username is optional OCI basic auth username.
-	// +optional
-	username string,
-
-	// Password is optional OCI basic auth password/token.
-	// +optional
-	password *dagger.Secret,
-
-	// Insecure allows pushing to an HTTP/insecure registry.
-	// +optional
-	// +default=false
-	insecure bool,
-) (string, error) {
-	resolvedDirs, err := m.resolveComponentDirs(ctx, componentDirs)
-	if err != nil {
-		return "", err
+func validatePublishInput(registry, repository, tag, username string, password *dagger.Secret, maxParallel int) error {
+	if !registryPattern.MatchString(registry) || strings.Contains(registry, "://") {
+		return fmt.Errorf("registry must be a hostname with optional port and no scheme")
 	}
-
-	if registryHostname == "" {
-		registryHostname, err = registry.Endpoint(ctx)
-		if err != nil {
-			return "", err
-		}
+	if repository != "" && !namePattern.MatchString(strings.Trim(repository, "/")) {
+		return fmt.Errorf("invalid repository %q", repository)
 	}
-	if err := validateCredentials(username, password); err != nil {
-		return "", err
+	if tag != "" && !regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`).MatchString(tag) {
+		return fmt.Errorf("invalid tag %q", tag)
 	}
-
-	var containers []*dagger.Container
-	var pushed []string
-	componentByBase := make(map[string]string, len(resolvedDirs))
-	for _, componentDir := range resolvedDirs {
-		base, err := imageBase(ctx, registryHostname, repository, path.Base(componentDir))
-		if err != nil {
-			return "", err
-		}
-		if existing, found := componentByBase[base]; found {
-			return "", fmt.Errorf("components %q and %q resolve to the same OCI image %q", existing, componentDir, base)
-		}
-		componentByBase[base] = componentDir
-
-		componentContainers, refs, err := m.publishContainers(ctx, componentDir, registry, registryHostname, base, tag, username, password, insecure)
-		if err != nil {
-			return "", err
-		}
-		containers = append(containers, componentContainers...)
-		pushed = append(pushed, refs...)
+	if (strings.TrimSpace(username) == "") != (password == nil) {
+		return fmt.Errorf("username and password must be provided together")
 	}
-
-	if err := syncPublishContainers(ctx, containers); err != nil {
-		return "", err
-	}
-	return strings.Join(pushed, "\n"), nil
-}
-
-func normalizedWashVersion(version string) string {
-	version = strings.TrimSpace(version)
-	if version == "" || strings.HasPrefix(version, "v") || strings.HasPrefix(version, "wash-v") {
-		return version
-	}
-	if version[0] >= '0' && version[0] <= '9' {
-		return "v" + version
-	}
-	return version
-}
-
-func cleanComponentDir(componentDir string) string {
-	componentDir = strings.TrimSpace(componentDir)
-	if componentDir == "" || componentDir == "/" {
-		return "."
-	}
-	return strings.TrimPrefix(path.Clean(componentDir), "/")
-}
-
-func targetCacheKey(componentDir string) string {
-	componentDir = cleanComponentDir(componentDir)
-	if componentDir == "." {
-		return "wash-target-root"
-	}
-
-	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-", " ", "_")
-	return "wash-target-" + replacer.Replace(componentDir)
-}
-
-func imageBase(
-	ctx context.Context,
-	registry string,
-	repository, componentName string,
-) (string, error) {
-	registry = strings.Trim(strings.TrimSpace(registry), "/")
-	repository = strings.Trim(strings.TrimSpace(repository), "/")
-	componentName = strings.Trim(strings.TrimSpace(componentName), "/")
-
-	if registry == "" {
-		return "", fmt.Errorf("registry is required")
-	}
-	if componentName == "" || componentName == "." {
-		return "", fmt.Errorf("componentName is required when componentDir has no basename")
-	}
-
-	url := registry
-	if repository != "" {
-		url += "/" + repository
-	}
-	url += "/" + componentName
-	return url, nil
-}
-
-func refsFor(base, tag string) []string {
-	refs := []string{base + ":latest"}
-	tag = strings.TrimSpace(tag)
-	if tag != "" && tag != "latest" {
-		refs = append([]string{base + ":" + tag}, refs...)
-	}
-	return refs
-}
-
-func validateCredentials(username string, password *dagger.Secret) error {
-	if strings.TrimSpace(username) == "" && password != nil {
-		return fmt.Errorf("username is required when password is provided")
-	}
-	if strings.TrimSpace(username) != "" && password == nil {
-		return fmt.Errorf("password secret is required when username is provided")
+	if maxParallel < 1 {
+		return fmt.Errorf("maxParallel must be at least 1")
 	}
 	return nil
 }
 
-func (m *Wash) publishContainers(
-	ctx context.Context,
-	componentDir string,
-	registry *dagger.Service,
-	registryHostname string,
-	base string,
+func refsFor(base, tag string) []string {
+	if tag != "" && tag != "latest" {
+		return []string{base + ":" + tag, base + ":latest"}
+	}
+	return []string{base + ":latest"}
+}
+
+type publishJob struct {
+	Ref string
+	Run func(context.Context) error
+}
+type publishResult struct {
+	Ref string
+	Err error
+}
+
+func runPublishJobs(ctx context.Context, jobs []publishJob, limit int) []publishResult {
+	results := make([]publishResult, len(jobs))
+	semaphore := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := range jobs {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := ctx.Err(); err != nil {
+				results[i] = publishResult{jobs[i].Ref, err}
+				return
+			}
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				results[i] = publishResult{jobs[i].Ref, ctx.Err()}
+				return
+			}
+			defer func() { <-semaphore }()
+			results[i] = publishResult{jobs[i].Ref, jobs[i].Run(ctx)}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func formatPublishResults(results []publishResult) (string, error) {
+	succeeded, failed := []string{}, []string{}
+	for _, result := range results {
+		if result.Err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", result.Ref, result.Err))
+		} else {
+			succeeded = append(succeeded, result.Ref)
+		}
+	}
+	output := strings.Join(succeeded, "\n")
+	if len(failed) == 0 {
+		return output, nil
+	}
+	return output, fmt.Errorf("publication failures:\n%s\nsucceeded:\n%s", strings.Join(failed, "\n"), strings.Join(succeeded, "\n"))
+}
+
+// PublishComponents builds components and pushes an optional version followed by latest.
+func (m *Wash) PublishComponents(ctx context.Context,
+	// Registry is the required registry hostname with optional port.
+	registry string,
+	// +optional
+	// Repository is an optional repository prefix.
+	repository string,
+	// +optional
+	// ComponentDirs limits publication; omitting it discovers all components.
+	componentDirs []string,
+	// +optional
+	// RegistryService binds an optional in-session registry.
+	registryService *dagger.Service,
+	// +optional
+	// Tag is pushed in addition to latest.
 	tag string,
+	// +optional
+	// Username authenticates registry pushes when password is also supplied.
 	username string,
+	// +optional
+	// Password authenticates registry pushes when username is also supplied.
 	password *dagger.Secret,
+	// +optional
+	// Insecure allows an insecure registry connection.
 	insecure bool,
-) ([]*dagger.Container, []string, error) {
-	refs := refsFor(base, tag)
-	c, artifactPath, err := m.buildContainer(ctx, componentDir)
+	// +optional
+	// +default=8
+	maxParallel int,
+) (string, error) {
+	username = strings.TrimSpace(username)
+	if err := validatePublishInput(registry, repository, tag, username, password, maxParallel); err != nil {
+		return "", err
+	}
+	plans, err := m.resolveComponents(ctx, componentDirs)
 	if err != nil {
-		return nil, nil, err
+		return "", err
 	}
-	c = c.WithServiceBinding(registryHostname, registry)
-
-	containers := make([]*dagger.Container, 0, len(refs))
-	for _, ref := range refs {
-		containers = append(containers, publishRef(c, ref, artifactPath, username, password, insecure))
+	artifacts, err := m.buildArtifacts(ctx, plans)
+	if err != nil {
+		return "", err
 	}
-	return containers, refs, nil
-}
-
-func publishRef(
-	c *dagger.Container,
-	ref string,
-	artifactPath string,
-	username string,
-	password *dagger.Secret,
-	insecure bool,
-) *dagger.Container {
-	args := []string{"wash", "oci", "push"}
-	if insecure {
-		args = append(args, "--insecure")
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return "", fmt.Errorf("create publish nonce: %w", err)
 	}
-
-	if username == "" || password == nil {
-		return c.WithExec(append(args, ref, artifactPath))
+	nonce := hex.EncodeToString(nonceBytes)
+	jobs := []publishJob{}
+	for _, plan := range plans {
+		base := registry
+		if repository != "" {
+			base += "/" + strings.Trim(repository, "/")
+		}
+		base += "/" + plan.ID
+		for _, ref := range refsFor(base, strings.TrimSpace(tag)) {
+			ref, artifact := ref, artifacts[plan.ID]
+			jobs = append(jobs, publishJob{Ref: ref, Run: func(ctx context.Context) error {
+				c, err := publisherContainer(ctx)
+				if err != nil {
+					return err
+				}
+				c = c.WithFile("/artifact/component.wasm", artifact)
+				if registryService != nil {
+					alias := strings.Split(registry, ":")[0]
+					c = c.WithServiceBinding(alias, registryService)
+				}
+				c = c.WithEnvVariable("_WASH_PUBLISH_NONCE", nonce).WithEnvVariable("WASH_REF", ref)
+				script := `exec wash oci push "$WASH_REF" /artifact/component.wasm`
+				if insecure {
+					script = `exec wash oci push --insecure "$WASH_REF" /artifact/component.wasm`
+				}
+				if username != "" {
+					c = c.WithEnvVariable("WASH_REG_USER", username).WithSecretVariable("WASH_REG_PASSWORD", password)
+					script = `exec wash oci push -u "$WASH_REG_USER" -p "$WASH_REG_PASSWORD" "$WASH_REF" /artifact/component.wasm`
+					if insecure {
+						script = `exec wash oci push --insecure -u "$WASH_REG_USER" -p "$WASH_REG_PASSWORD" "$WASH_REF" /artifact/component.wasm`
+					}
+				}
+				_, err = c.WithExec([]string{"sh", "-c", script}).Sync(ctx)
+				return err
+			}})
+		}
 	}
-
-	c = c.
-		WithEnvVariable("WASH_REG_USER", username).
-		WithSecretVariable("WASH_REG_PASSWORD", password)
-	script := fmt.Sprintf(
-		"%s -u \"$WASH_REG_USER\" -p \"$WASH_REG_PASSWORD\" %q %q",
-		strings.Join(args, " "),
-		ref,
-		artifactPath,
-	)
-	return c.WithExec([]string{"sh", "-c", script})
-}
-
-func syncPublishContainers(ctx context.Context, containers []*dagger.Container) error {
-	const markerPath = "/tmp/wash-published"
-
-	published := dag.Directory()
-	for i, c := range containers {
-		c = c.WithExec([]string{"touch", markerPath})
-		published = published.WithFile(fmt.Sprintf("%d", i), c.File(markerPath))
-	}
-	_, err := published.Sync(ctx)
-	return err
+	return formatPublishResults(runPublishJobs(ctx, jobs, maxParallel))
 }
