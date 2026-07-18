@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["components/a", "components/b", "components/fallback"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85.0"

@@ -21,3 +21,14 @@ Publication always pushes `latest` and additionally pushes a non-`latest` tag wh
 The module installs the wash CLI 2.5.2 Linux release binary selected for Dagger's default platform (`amd64` or `arm64`). Each asset is fetched directly with its pinned SHA-256 checksum and executable permissions; unsupported platforms are rejected.
 
 The former `Container`, single-component build/publish, and WIT APIs were removed.
+
+## Tests
+
+Run unit tests and the public-boundary Dagger integration suite from the repository root:
+
+```bash
+cd wash && dagger run go test ./...
+cd .. && dagger -m ./wash/tests call all
+```
+
+The integration suite builds a multi-component Cargo workspace, exercises the `wash build` fallback, and publishes version plus `latest` refs to an in-session disposable registry.
