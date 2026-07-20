@@ -562,7 +562,8 @@ func formatPublishResults(results []publishResult) (string, error) {
 
 // PublishComponents builds components and pushes an optional version followed by latest.
 func (m *Wash) PublishComponents(ctx context.Context,
-	// Registry is the required registry hostname with optional port.
+	// Registry is the required registry hostname with optional port. Though marked as optional to allow .env to supply it, it is required.
+	// +optional
 	registry string,
 	// +optional
 	// Repository is an optional repository prefix.
