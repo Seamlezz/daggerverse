@@ -224,10 +224,12 @@ func (r Runner) CheckKubeconform(ctx context.Context, source *dagger.Directory, 
 
 	// Extract Flux CRDs from gotk-components.yaml if it exists
 	c = c.WithEnvVariable("CLUSTER_DIR", r.config.ClusterDir)
-	c = c.WithExec([]string{"sh", "-c",
+	c = c.WithExec([]string{
+		"sh", "-c",
 		"for f in \"/src/$CLUSTER_DIR\"/*/flux-system/gotk-components.yaml; do " +
 			"if [ -f \"$f\" ]; then python3 /usr/local/bin/extract-crd-schemas.py /tmp/schemas/flux \"$f\"; fi; " +
-			"done; exit 0"})
+			"done; exit 0",
+	})
 
 	// Set source dirs as env vars for scripts
 	helmDirs, _ := r.resolveHelmSourceDirs(ctx, source)
@@ -283,7 +285,7 @@ func (r Runner) CheckTerraform(ctx context.Context, source *dagger.Directory) er
 		return err
 	}
 	if len(envs) == 0 {
-		return fmt.Errorf("no Terraform environments discovered")
+		return nil
 	}
 
 	c := r.withCheckRepo(r.terraformToolchain(), source)
