@@ -59,8 +59,9 @@ func (m *Tests) Fallback(ctx context.Context) error {
 // Publish verifies version/latest publication through an in-session registry.
 func (m *Tests) Publish(ctx context.Context) error {
 	registry := fixtureRegistry()
-	published, err := fixtureWash().PublishComponents(ctx, "registry:5000", dagger.WashPublishComponentsOpts{
+	published, err := fixtureWash().PublishComponents(ctx, dagger.WashPublishComponentsOpts{
 		ComponentDirs:   []string{"components/a", "components/b"},
+		Registry:        "registry:5000",
 		RegistryService: registry,
 		Repository:      "wash-tests",
 		Tag:             "v1",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -20,14 +21,14 @@ import (
 const (
 	workspaceDir      = "/workspace"
 	outputDir         = "/out"
-	washVersion       = "v2.5.2"
+	washVersion       = "v2.6.1"
 	cacheSchema       = "wash-v2"
 	fallbackRustImage = "rust:1.95-bookworm"
 
-	washArm64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.5.2/wash-aarch64-unknown-linux-gnu"
-	washArm64Checksum = "sha256:2c29cc651b87062d60c145942abce022c431710e398c47213f04d59062db4683"
-	washAMD64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.5.2/wash-x86_64-unknown-linux-gnu"
-	washAMD64Checksum = "sha256:fef1e14a645144c84b4518ff5c907510b28dcd050576b80bd2c1d9d0dba6f02a"
+	washArm64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.6.1/wash-aarch64-unknown-linux-gnu"
+	washArm64Checksum = "sha256:66ac821de7b1ef2446de4907cd77b76a22ff9b53c2f281c30e8bc5eb11b12641"
+	washAMD64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.6.1/wash-x86_64-unknown-linux-gnu"
+	washAMD64Checksum = "sha256:427481420f6b4320e23e5b373281c6d15cdb9f129e4675550860da44e99fe431"
 )
 
 // Wash builds and publishes wasmCloud components.
@@ -560,6 +561,28 @@ func formatPublishResults(results []publishResult) (string, error) {
 	return output, fmt.Errorf("publication failures:\n%s\nsucceeded:\n%s", strings.Join(failed, "\n"), strings.Join(succeeded, "\n"))
 }
 
+func withCommandOutput(err error, stderr, stdout string) error {
+	details := []string{}
+	if stderr = strings.TrimSpace(stderr); stderr != "" {
+		details = append(details, "stderr:\n"+stderr)
+	}
+	if stdout = strings.TrimSpace(stdout); stdout != "" {
+		details = append(details, "stdout:\n"+stdout)
+	}
+	if len(details) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w\n%s", err, strings.Join(details, "\n"))
+}
+
+func publicationCommandError(err error) error {
+	var execErr *dagger.ExecError
+	if !errors.As(err, &execErr) {
+		return err
+	}
+	return withCommandOutput(err, execErr.Stderr, execErr.Stdout)
+}
+
 // PublishComponents builds components and pushes an optional version followed by latest.
 func (m *Wash) PublishComponents(ctx context.Context,
 	// Registry is the required registry hostname with optional port. Though marked as optional to allow .env to supply it, it is required.
@@ -639,7 +662,7 @@ func (m *Wash) PublishComponents(ctx context.Context,
 					}
 				}
 				_, err = c.WithExec([]string{"sh", "-c", script}).Sync(ctx)
-				return err
+				return publicationCommandError(err)
 			}})
 		}
 	}

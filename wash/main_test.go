@@ -180,6 +180,18 @@ func TestFormatPublishResultsAggregatesInOrder(t *testing.T) {
 	}
 }
 
+func TestWithCommandOutputPreservesActionableDetails(t *testing.T) {
+	original := errors.New("exit code 101")
+	err := withCommandOutput(original, "  registry rejected manifest  ", "  upload started  ")
+	if !errors.Is(err, original) {
+		t.Fatal("wrapped error does not preserve its cause")
+	}
+	want := "exit code 101\nstderr:\nregistry rejected manifest\nstdout:\nupload started"
+	if err.Error() != want {
+		t.Fatalf("error %q, want %q", err, want)
+	}
+}
+
 func TestRunPublishJobsRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

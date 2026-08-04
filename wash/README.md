@@ -18,7 +18,7 @@ Cargo registry and git caches are stable per Rust version. Workspace target cach
 
 Publication always pushes `latest` and additionally pushes a non-`latest` tag when supplied. Registry is a hostname with optional port and no scheme; `registryService` is an independent optional in-session service. Username and password must be supplied together. Ref pushes run concurrently with `maxParallel` (default 8), every ref is attempted, and failures are aggregated. A nonce invalidates only push executions, leaving toolchain and build nodes cacheable.
 
-The module installs the wash CLI 2.5.2 Linux release binary selected for Dagger's default platform (`amd64` or `arm64`). Each asset is fetched directly with its pinned SHA-256 checksum and executable permissions; unsupported platforms are rejected.
+The module installs the wash CLI 2.6.1 Linux release binary selected for Dagger's default platform (`amd64` or `arm64`). Each asset is fetched directly with its pinned SHA-256 checksum and executable permissions; unsupported platforms are rejected.
 
 The former `Container`, single-component build/publish, and WIT APIs were removed.
 
