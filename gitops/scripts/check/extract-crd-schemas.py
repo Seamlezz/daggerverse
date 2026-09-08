@@ -14,11 +14,24 @@ def load_documents(path: Path) -> list[dict]:
         return [doc for doc in yaml.safe_load_all(handle.read()) if isinstance(doc, dict)]
 
 
+def normalize_formats(value):
+    if isinstance(value, list):
+        return [normalize_formats(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: normalize_formats(item) for key, item in value.items()}
+    # Kubernetes durations use Go syntax; JSON Schema duration expects ISO 8601.
+    # Retain the CRD pattern as the validator when the CRD supplies one.
+    if result.get("format") == "duration" and result.get("pattern"):
+        del result["format"]
+    return result
+
+
 def crd_to_schema(crd: dict, version_entry: dict) -> dict:
     group = crd["spec"]["group"]
     kind = crd["spec"]["names"]["kind"]
     version = version_entry["name"]
-    schema = version_entry.get("schema", {}).get("openAPIV3Schema", {"type": "object"})
+    schema = normalize_formats(version_entry.get("schema", {}).get("openAPIV3Schema", {"type": "object"}))
     return {
         "type": "object",
         "properties": {
@@ -42,7 +55,7 @@ def write_schemas_from_documents(documents: Iterable[dict], out_dir: Path) -> No
                 continue
             kind = doc["spec"]["names"]["kind"]
             version = version_entry["name"]
-            target = out_dir / f"{kind}_{version}.json"
+            target = out_dir / f"{kind.lower()}_{version}.json"
             target.write_text(json.dumps(crd_to_schema(doc, version_entry), indent=2) + "\n")
 
 
