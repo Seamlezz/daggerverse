@@ -21,14 +21,14 @@ import (
 const (
 	workspaceDir      = "/workspace"
 	outputDir         = "/out"
-	washVersion       = "v2.6.1"
+	washVersion       = "v2.9.0"
 	cacheSchema       = "wash-v2"
 	fallbackRustImage = "rust:1.95-bookworm"
 
-	washArm64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.6.1/wash-aarch64-unknown-linux-gnu"
-	washArm64Checksum = "sha256:66ac821de7b1ef2446de4907cd77b76a22ff9b53c2f281c30e8bc5eb11b12641"
-	washAMD64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.6.1/wash-x86_64-unknown-linux-gnu"
-	washAMD64Checksum = "sha256:427481420f6b4320e23e5b373281c6d15cdb9f129e4675550860da44e99fe431"
+	washArm64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.9.0/wash-aarch64-unknown-linux-gnu"
+	washArm64Checksum = "sha256:8ad34c75e1af74152bd428fe655721b6991a65dea4fe53c58eb9f4f22189e0d3"
+	washAMD64URL      = "https://github.com/wasmCloud/wasmCloud/releases/download/v2.9.0/wash-x86_64-unknown-linux-gnu"
+	washAMD64Checksum = "sha256:590130b23d897e80ba948c15cfd317e946e1b22b73b6d534af57dfec1e4f4bf6"
 )
 
 // Wash builds and publishes wasmCloud components.
